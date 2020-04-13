@@ -1,1 +1,4 @@
 /libs
+/.vs
+/x64
+/vkSample.vcxproj.user
