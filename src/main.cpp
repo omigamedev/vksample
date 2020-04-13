@@ -29,9 +29,9 @@ int main()
     };
     vk::InstanceCreateInfo instance_info;
     instance_info.pApplicationInfo = &instance_app_info;
-    instance_info.enabledLayerCount = instance_layers.size();
+    instance_info.enabledLayerCount = (uint32_t)instance_layers.size();
     instance_info.ppEnabledLayerNames = instance_layers.data();
-    instance_info.enabledExtensionCount = instance_extensions.size();
+    instance_info.enabledExtensionCount = (uint32_t)instance_extensions.size();
     instance_info.ppEnabledExtensionNames = instance_extensions.data();
     vk::UniqueInstance instance = vk::createInstanceUnique(instance_info);
 
@@ -79,13 +79,14 @@ int main()
                 vk::DeviceCreateInfo device_info;
                 device_info.queueCreateInfoCount = 1;
                 device_info.pQueueCreateInfos = &queue_info;
-                device_info.enabledLayerCount = device_layers.size();
+                device_info.enabledLayerCount = (uint32_t)device_layers.size();
                 device_info.ppEnabledLayerNames = device_layers.data();
-                device_info.enabledExtensionCount = device_extensions.size();
+                device_info.enabledExtensionCount = (uint32_t)device_extensions.size();
                 device_info.ppEnabledExtensionNames = device_extensions.data();
                 device_info.pEnabledFeatures = &device_features;
                 device = pd.createDeviceUnique(device_info);
                 physical_device = pd;
+                device_family = family_index;
             }
         }
     }
@@ -93,11 +94,37 @@ int main()
     auto pd_props = physical_device.getProperties();
     std::cout << "Device: " << pd_props.deviceName << "\n";
 
+    vk::SurfaceCapabilitiesKHR surface_caps = physical_device.getSurfaceCapabilitiesKHR(*surface);
+    std::vector<vk::SurfaceFormatKHR> swapchain_formats = physical_device.getSurfaceFormatsKHR(*surface);
+    vk::SwapchainCreateInfoKHR swapchain_info;
+    swapchain_info.surface = *surface;
+    swapchain_info.minImageCount = 2;
+    swapchain_info.imageFormat = vk::Format::eB8G8R8A8Unorm;
+    swapchain_info.imageColorSpace = vk::ColorSpaceKHR::eSrgbNonlinear;
+    swapchain_info.imageExtent = surface_caps.currentExtent;
+    swapchain_info.imageArrayLayers = 1;
+    swapchain_info.imageUsage = vk::ImageUsageFlagBits::eColorAttachment;
+    swapchain_info.presentMode = vk::PresentModeKHR::eFifo;
+    swapchain_info.clipped = true;
+    vk::UniqueSwapchainKHR swapchain = device->createSwapchainKHRUnique(swapchain_info);
+    std::vector<vk::Image> swapchain_images = device->getSwapchainImagesKHR(*swapchain);
+
+    vk::Queue q = device->getQueue(device_family, 0);
+
     MSG msg;
+    uint32_t swapchain_index = 0;
     while (GetMessage(&msg, hWnd, 0, 0) > 0)
     {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
+
+        vk::PresentInfoKHR present_info;
+        present_info.swapchainCount = 1;
+        present_info.pSwapchains = &swapchain.get();
+        present_info.pImageIndices = &swapchain_index;
+        q.presentKHR(present_info);
+        q.waitIdle();
+        swapchain_index = (swapchain_index + 1) % swapchain_images.size();
     }
 
     device->waitIdle();
