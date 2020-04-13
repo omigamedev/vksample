@@ -111,20 +111,27 @@ int main()
 
     vk::Queue q = device->getQueue(device_family, 0);
 
+    //device->createCommandPoolUnique(cmdpool_info);
+
     MSG msg;
-    uint32_t swapchain_index = 0;
     while (GetMessage(&msg, hWnd, 0, 0) > 0)
     {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
 
-        vk::PresentInfoKHR present_info;
-        present_info.swapchainCount = 1;
-        present_info.pSwapchains = &swapchain.get();
-        present_info.pImageIndices = &swapchain_index;
-        q.presentKHR(present_info);
-        q.waitIdle();
-        swapchain_index = (swapchain_index + 1) % swapchain_images.size();
+        vk::UniqueSemaphore backbuffer_semaphore = device->createSemaphoreUnique({});
+        auto backbuffer = device->acquireNextImageKHR(*swapchain, UINT64_MAX, *backbuffer_semaphore, nullptr);
+        if (backbuffer.result == vk::Result::eSuccess)
+        {
+            vk::PresentInfoKHR present_info;
+            present_info.waitSemaphoreCount = 1;
+            present_info.pWaitSemaphores = &backbuffer_semaphore.get();
+            present_info.swapchainCount = 1;
+            present_info.pSwapchains = &swapchain.get();
+            present_info.pImageIndices = &backbuffer.value;
+            q.presentKHR(present_info);
+            q.waitIdle();
+        }
     }
 
     device->waitIdle();
