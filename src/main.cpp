@@ -103,7 +103,7 @@ int main()
     swapchain_info.imageColorSpace = vk::ColorSpaceKHR::eSrgbNonlinear;
     swapchain_info.imageExtent = surface_caps.currentExtent;
     swapchain_info.imageArrayLayers = 1;
-    swapchain_info.imageUsage = vk::ImageUsageFlagBits::eColorAttachment;
+    swapchain_info.imageUsage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst;
     swapchain_info.presentMode = vk::PresentModeKHR::eFifo;
     swapchain_info.clipped = true;
     vk::UniqueSwapchainKHR swapchain = device->createSwapchainKHRUnique(swapchain_info);
@@ -111,7 +111,43 @@ int main()
 
     vk::Queue q = device->getQueue(device_family, 0);
 
-    //device->createCommandPoolUnique(cmdpool_info);
+    vk::UniqueCommandPool cmdpool = device->createCommandPoolUnique({ {}, device_family });
+    vk::CommandBufferAllocateInfo cmd_clear_info;
+    cmd_clear_info.commandPool = *cmdpool;
+    cmd_clear_info.level = vk::CommandBufferLevel::ePrimary;
+    cmd_clear_info.commandBufferCount = (uint32_t)swapchain_images.size();
+    std::vector<vk::UniqueCommandBuffer> cmd_clear = device->allocateCommandBuffersUnique(cmd_clear_info);
+
+    std::vector<vk::CommandBuffer> submit_commands(swapchain_images.size());
+    for (int i = 0; i < swapchain_images.size(); i++)
+    {
+        cmd_clear[i]->begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        vk::ImageMemoryBarrier barrier;
+        barrier.srcAccessMask = {};
+        barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+        barrier.oldLayout = vk::ImageLayout::eUndefined;
+        barrier.newLayout = vk::ImageLayout::ePresentSrcKHR;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = swapchain_images[i];
+        barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+        cmd_clear[i]->pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics, vk::PipelineStageFlagBits::eTransfer,
+            vk::DependencyFlagBits::eByRegion, nullptr, nullptr, barrier);
+        //cmd_clear[i]->clearColorImage(*swapchain_images[i], )
+        cmd_clear[i]->end();
+        submit_commands[i] = *cmd_clear[i];
+    }
+
+    vk::UniqueFence submit_fence = device->createFenceUnique({});
+    vk::SubmitInfo submit_info;
+    submit_info.commandBufferCount = 2;
+    submit_info.pCommandBuffers = submit_commands.data();
+    q.submit(submit_info, *submit_fence);
+    q.waitIdle();
 
     MSG msg;
     while (GetMessage(&msg, hWnd, 0, 0) > 0)
