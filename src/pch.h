@@ -5,3 +5,4 @@
 #include <vulkan/vulkan.hpp>
 
 #include <windows.h>
+#include <stb_image.h>
