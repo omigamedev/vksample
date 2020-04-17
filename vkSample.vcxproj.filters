@@ -16,6 +16,10 @@
     <Filter Include="Libs">
       <UniqueIdentifier>{6acef585-9caf-477a-b693-bb4efe187639}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Shaders">
+      <UniqueIdentifier>{77e9a041-6124-41ec-b8a0-9d1678f689d2}</UniqueIdentifier>
+      <Extensions>vert;frag</Extensions>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp">
@@ -34,5 +38,13 @@
     <ClInclude Include="src\pch.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="shaders\*.frag">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
+    <CustomBuild Include="shaders\*.vert">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
   </ItemGroup>
 </Project>

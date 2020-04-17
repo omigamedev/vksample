@@ -2,3 +2,4 @@
 /.vs
 /x64
 /vkSample.vcxproj.user
+/shaders/*.spv

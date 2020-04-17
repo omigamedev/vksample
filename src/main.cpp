@@ -100,6 +100,22 @@ void change_layout(const vk::UniqueImage& image, vk::ImageLayout src, vk::ImageL
     q.waitIdle();
 }
 
+vk::UniqueShaderModule load_shader_module(const std::string& path)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open())
+        throw std::runtime_error("cannot open the file " + path);
+    size_t size = file.tellg();
+    file.seekg(std::ios::beg);
+    std::unique_ptr<char[]> buffer = std::make_unique<char[]>(size);
+    file.read(buffer.get(), size);
+
+    vk::ShaderModuleCreateInfo module_info;
+    module_info.codeSize = size;
+    module_info.pCode = reinterpret_cast<uint32_t*>(buffer.get());
+    return device->createShaderModuleUnique(module_info);
+}
+
 int main()
 {
     //getchar();
@@ -150,7 +166,7 @@ int main()
 
     // Create device
 
-    uint32_t device_family;
+    uint32_t device_family = 0;
     std::vector<vk::PhysicalDevice> physical_devices = instance->enumeratePhysicalDevices();
     for (const auto& pd : physical_devices)
     {
@@ -246,9 +262,109 @@ int main()
     uint8_t* image_mem_ptr = static_cast<uint8_t*>(device->mapMemory(*image_mem, 0, VK_WHOLE_SIZE));
     for (int row = 0; row < image_height; row++)
         std::copy_n(image_rgba.get() + row * image_width * 4,   // source
-            image_width * 4ull,                                 // size
+            (uint64_t)image_width * 4ull,                       // size
             image_mem_ptr + row * image_layout.rowPitch);       // destination
     device->unmapMemory(*image_mem);
+
+    // Create PipelineLayout
+
+    vk::PipelineLayoutCreateInfo pipeline_layout_info;
+    pipeline_layout_info.setLayoutCount = 0;
+    pipeline_layout_info.pushConstantRangeCount = 0;
+    vk::UniquePipelineLayout pipeline_layout = device->createPipelineLayoutUnique(pipeline_layout_info);
+
+    // Renderpass
+
+    vk::AttachmentDescription renderpass_attachment_color;
+    renderpass_attachment_color.format = swapchain_info.imageFormat;
+    renderpass_attachment_color.samples = vk::SampleCountFlagBits::e1;
+    renderpass_attachment_color.loadOp = vk::AttachmentLoadOp::eLoad;
+    renderpass_attachment_color.storeOp = vk::AttachmentStoreOp::eStore;
+    renderpass_attachment_color.stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
+    renderpass_attachment_color.stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
+    renderpass_attachment_color.initialLayout = vk::ImageLayout::eColorAttachmentOptimal;
+    renderpass_attachment_color.finalLayout = vk::ImageLayout::ePresentSrcKHR;
+    vk::AttachmentReference renderpass_ref_color;
+    renderpass_ref_color.attachment = 0;
+    renderpass_ref_color.layout = vk::ImageLayout::eColorAttachmentOptimal;
+    vk::SubpassDescription renderpass_subpass;
+    renderpass_subpass.pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
+    renderpass_subpass.colorAttachmentCount = 1;
+    renderpass_subpass.pColorAttachments = &renderpass_ref_color;
+    vk::RenderPassCreateInfo renderpass_info;
+    renderpass_info.attachmentCount = 1;
+    renderpass_info.pAttachments = &renderpass_attachment_color;
+    renderpass_info.subpassCount = 1;
+    renderpass_info.pSubpasses = &renderpass_subpass;
+    renderpass_info.dependencyCount = 0;
+    renderpass_info.pDependencies = nullptr;
+    vk::UniqueRenderPass renderpass = device->createRenderPassUnique(renderpass_info);
+
+    // Create Pipeline
+
+    vk::UniqueShaderModule module_triangle_vert = load_shader_module("shaders/triangle.vert.spv");
+    vk::UniqueShaderModule module_triangle_frag = load_shader_module("shaders/triangle.frag.spv");
+    std::array<vk::PipelineShaderStageCreateInfo, 2> pipeline_stages{
+        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eVertex, *module_triangle_vert, "main"),
+        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eFragment, *module_triangle_frag, "main"),
+    };
+
+    vk::PipelineVertexInputStateCreateInfo pipeline_input;
+
+    vk::PipelineInputAssemblyStateCreateInfo pipeline_assembly;
+    pipeline_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+    pipeline_assembly.primitiveRestartEnable = false;
+
+    vk::Viewport pipeline_viewport_vp{ 0, 0, (float)surface_caps.currentExtent.width, (float)surface_caps.currentExtent.height, 0.f, 1.f };
+    vk::Rect2D pipeline_viewport_scissor{ {}, surface_caps.currentExtent };
+    vk::PipelineViewportStateCreateInfo pipeline_viewport;
+    pipeline_viewport.viewportCount = 1;
+    pipeline_viewport.pViewports = &pipeline_viewport_vp;
+    pipeline_viewport.scissorCount = 1;
+    pipeline_viewport.pScissors = &pipeline_viewport_scissor;
+
+    vk::PipelineRasterizationStateCreateInfo pipeline_raster;
+    pipeline_raster.depthClampEnable = false;
+    pipeline_raster.rasterizerDiscardEnable = false;
+    pipeline_raster.polygonMode = vk::PolygonMode::eFill;
+    pipeline_raster.cullMode = vk::CullModeFlagBits::eNone;
+    pipeline_raster.frontFace = vk::FrontFace::eClockwise;
+    pipeline_raster.depthBiasEnable = false;
+    pipeline_raster.lineWidth = 1.f;
+
+    vk::PipelineMultisampleStateCreateInfo pipeline_multisample;
+    pipeline_multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+    pipeline_multisample.sampleShadingEnable = false;
+
+    vk::PipelineColorBlendAttachmentState pipeline_blend_color;
+    pipeline_blend_color.blendEnable = false;
+    pipeline_blend_color.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    vk::PipelineColorBlendStateCreateInfo pipeline_blend;
+    pipeline_blend.logicOpEnable = false;
+    pipeline_blend.attachmentCount = 1;
+    pipeline_blend.pAttachments = &pipeline_blend_color;
+
+    vk::PipelineDynamicStateCreateInfo pipeline_dynamic;
+    pipeline_dynamic.dynamicStateCount = 0;
+
+    vk::GraphicsPipelineCreateInfo pipeline_info;
+    pipeline_info.stageCount = (uint32_t)pipeline_stages.size();
+    pipeline_info.pStages = pipeline_stages.data();
+    pipeline_info.pVertexInputState = &pipeline_input;
+    pipeline_info.pInputAssemblyState = &pipeline_assembly;
+    pipeline_info.pTessellationState = nullptr;
+    pipeline_info.pViewportState = &pipeline_viewport;
+    pipeline_info.pRasterizationState = &pipeline_raster;
+    pipeline_info.pMultisampleState = &pipeline_multisample;
+    pipeline_info.pDepthStencilState = nullptr;
+    pipeline_info.pColorBlendState = &pipeline_blend;
+    pipeline_info.pDynamicState = &pipeline_dynamic;
+    pipeline_info.layout = *pipeline_layout;
+    pipeline_info.renderPass = *renderpass;
+    pipeline_info.subpass = 0;
+
+    vk::UniquePipeline pipeline = device->createGraphicsPipelineUnique(nullptr, pipeline_info);
 
     // Create clear screen command
 
@@ -257,7 +373,8 @@ int main()
     cmd_clear_info.level = vk::CommandBufferLevel::ePrimary;
     cmd_clear_info.commandBufferCount = (uint32_t)swapchain_images.size();
     std::vector<vk::UniqueCommandBuffer> cmd_clear = device->allocateCommandBuffersUnique(cmd_clear_info);
-
+    std::vector<vk::UniqueFramebuffer> framebuffers(swapchain_images.size());
+    std::vector<vk::UniqueImageView> swapchain_views(swapchain_images.size());
     std::vector<vk::CommandBuffer> submit_commands(swapchain_images.size());
     for (int i = 0; i < swapchain_images.size(); i++)
     {
@@ -290,16 +407,47 @@ int main()
             cmd_clear[i]->blitImage(*image, vk::ImageLayout::eTransferSrcOptimal,
                 swapchain_images[i], vk::ImageLayout::eTransferDstOptimal, blit_region, vk::Filter::eLinear);
 
-            //vk::ClearColorValue clear_color = std::array<float, 4>({ 1, 0, 1, 1 });
-            //cmd_clear[i]->clearColorImage(swapchain_images[i], vk::ImageLayout::eTransferDstOptimal, 
-            //    clear_color, barrier.subresourceRange);
-
             barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
             barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
             barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-            barrier.newLayout = vk::ImageLayout::ePresentSrcKHR;
-            cmd_clear[i]->pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eBottomOfPipe,
+            barrier.newLayout = vk::ImageLayout::eColorAttachmentOptimal;
+            cmd_clear[i]->pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eColorAttachmentOutput,
                 vk::DependencyFlagBits::eByRegion, nullptr, nullptr, barrier);
+
+            vk::ImageViewCreateInfo view_info;
+            view_info.image = swapchain_images[i];
+            view_info.viewType = vk::ImageViewType::e2D;
+            view_info.format = swapchain_info.imageFormat;
+            view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+            view_info.subresourceRange.baseArrayLayer = 0;
+            view_info.subresourceRange.baseMipLevel = 0;
+            view_info.subresourceRange.layerCount = 1;
+            view_info.subresourceRange.levelCount = 1;
+            swapchain_views[i] = device->createImageViewUnique(view_info);
+            vk::FramebufferCreateInfo framebuffer_info;
+            framebuffer_info.renderPass = *renderpass;
+            framebuffer_info.attachmentCount = 1;
+            framebuffer_info.pAttachments = &swapchain_views[i].get();
+            framebuffer_info.width = surface_caps.currentExtent.width;
+            framebuffer_info.height = surface_caps.currentExtent.height;
+            framebuffer_info.layers = 1;
+            framebuffers[i] = device->createFramebufferUnique(framebuffer_info);
+
+            vk::RenderPassBeginInfo renderpass_begin_info;
+            renderpass_begin_info.renderPass = *renderpass;
+            renderpass_begin_info.framebuffer = *framebuffers[i];
+            renderpass_begin_info.renderArea.extent = surface_caps.currentExtent;
+            renderpass_begin_info.renderArea.offset = {};
+            renderpass_begin_info.clearValueCount = 0;
+            renderpass_begin_info.pClearValues = nullptr;
+            cmd_clear[i]->beginRenderPass(renderpass_begin_info, vk::SubpassContents::eInline);
+            cmd_clear[i]->bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+            cmd_clear[i]->draw(3, 1, 0, 0);
+            cmd_clear[i]->endRenderPass();
+
+            //vk::ClearColorValue clear_color = std::array<float, 4>({ 1, 0, 1, 1 });
+            //cmd_clear[i]->clearColorImage(swapchain_images[i], vk::ImageLayout::eTransferDstOptimal, 
+            //    clear_color, barrier.subresourceRange);
         }
         cmd_clear[i]->end();
         submit_commands[i] = *cmd_clear[i];
