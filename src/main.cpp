@@ -1,9 +1,12 @@
 #include "pch.h"
 
-bool running = true;
+static bool running = true;
+
 static vk::UniqueDevice device;
-static vk::PhysicalDevice physical_device;
 static vk::UniqueCommandPool cmdpool;
+static vk::UniqueDescriptorPool descrpool;
+
+static vk::PhysicalDevice physical_device;
 static vk::Queue q;
 
 LRESULT WINAPI main_window_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -223,10 +226,14 @@ int main()
     vk::UniqueSwapchainKHR swapchain = device->createSwapchainKHRUnique(swapchain_info);
     std::vector<vk::Image> swapchain_images = device->getSwapchainImagesKHR(*swapchain);
 
-    // Create useful gloabal objects
+    // Create useful global objects
     
     q = device->getQueue(device_family, 0);
     cmdpool = device->createCommandPoolUnique({ {}, device_family });
+    std::array<vk::DescriptorPoolSize, 1> descrpool_sizes {
+        vk::DescriptorPoolSize{ vk::DescriptorType::eUniformBuffer, 2 },
+    };
+    descrpool = device->createDescriptorPoolUnique({ {}, 1, (uint32_t)descrpool_sizes.size(), descrpool_sizes.data() });
 
     // Load the image into a staging vulkan image
 
@@ -262,16 +269,65 @@ int main()
     uint8_t* image_mem_ptr = static_cast<uint8_t*>(device->mapMemory(*image_mem, 0, VK_WHOLE_SIZE));
     for (int row = 0; row < image_height; row++)
         std::copy_n(image_rgba.get() + row * image_width * 4,   // source
-            (uint64_t)image_width * 4ull,                       // size
+            (uint64_t)image_width * 4,                          // size
             image_mem_ptr + row * image_layout.rowPitch);       // destination
     device->unmapMemory(*image_mem);
 
     // Create PipelineLayout
 
+    std::array<vk::DescriptorSetLayoutBinding, 2> descrset_layout_bindings {
+        vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eVertex),
+        vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eFragment),
+    };
+    vk::DescriptorSetLayoutCreateInfo descrset_layout_info;
+    descrset_layout_info.bindingCount = (uint32_t)descrset_layout_bindings.size();
+    descrset_layout_info.pBindings = descrset_layout_bindings.data();
+    vk::UniqueDescriptorSetLayout descrset_layout = device->createDescriptorSetLayoutUnique(descrset_layout_info);
     vk::PipelineLayoutCreateInfo pipeline_layout_info;
-    pipeline_layout_info.setLayoutCount = 0;
+    pipeline_layout_info.setLayoutCount = 1;
+    pipeline_layout_info.pSetLayouts = &descrset_layout.get();
     pipeline_layout_info.pushConstantRangeCount = 0;
     vk::UniquePipelineLayout pipeline_layout = device->createPipelineLayoutUnique(pipeline_layout_info);
+
+    // Create DescriptorSets
+
+    struct uniform_buffers_t
+    {
+        glm::mat4 mvp;
+        uint8_t pad[0x100 - sizeof(mvp)]; // alignment
+        glm::vec4 col;
+    };
+
+    uniform_buffers_t uniforms;
+    uniforms.col = glm::vec4(0, 1, 0, 1);
+    uniforms.mvp = glm::eulerAngleZ(glm::radians(45.f));
+
+    vk::BufferCreateInfo uniform_buffer_info;
+    uniform_buffer_info.size = sizeof(uniform_buffers_t);
+    uniform_buffer_info.usage = vk::BufferUsageFlagBits::eUniformBuffer;
+    vk::UniqueBuffer uniform_buffer = device->createBufferUnique(uniform_buffer_info);
+    vk::MemoryRequirements uniform_mem_req = device->getBufferMemoryRequirements(*uniform_buffer);
+    uint32_t uniform_mem_idx = find_memory(uniform_mem_req,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    vk::UniqueDeviceMemory uniform_mem = device->allocateMemoryUnique({ uniform_mem_req.size, uniform_mem_idx });
+    device->bindBufferMemory(*uniform_buffer, *uniform_mem, 0);
+    if (uniform_buffers_t* uniforms_ptr = reinterpret_cast<uniform_buffers_t*>(device->mapMemory(*uniform_mem, 0, VK_WHOLE_SIZE)))
+    {
+        *uniforms_ptr = uniforms;
+        device->unmapMemory(*uniform_mem);
+    }
+
+    std::vector<vk::UniqueDescriptorSet> descr_sets = device->allocateDescriptorSetsUnique({ *descrpool, 1, &descrset_layout.get() });
+    
+    std::array<vk::DescriptorBufferInfo, 2> descr_sets_buffer{
+        vk::DescriptorBufferInfo(*uniform_buffer, offsetof(uniform_buffers_t, mvp), sizeof(uniform_buffers_t::mvp)),
+        vk::DescriptorBufferInfo(*uniform_buffer, offsetof(uniform_buffers_t, col), sizeof(uniform_buffers_t::col)),
+    };
+    std::array<vk::WriteDescriptorSet, 2> descr_sets_write{
+        vk::WriteDescriptorSet(*descr_sets[0], 0, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &descr_sets_buffer[0], nullptr),
+        vk::WriteDescriptorSet(*descr_sets[0], 1, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &descr_sets_buffer[1], nullptr),
+    };
+    device->updateDescriptorSets(descr_sets_write, nullptr);
 
     // Renderpass
 
@@ -378,7 +434,7 @@ int main()
     std::vector<vk::CommandBuffer> submit_commands(swapchain_images.size());
     for (int i = 0; i < swapchain_images.size(); i++)
     {
-        cmd_clear[i]->begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        cmd_clear[i]->begin({ vk::CommandBufferUsageFlags() });
         {
             vk::ImageMemoryBarrier barrier;
             barrier.image = swapchain_images[i];
@@ -441,6 +497,7 @@ int main()
             renderpass_begin_info.clearValueCount = 0;
             renderpass_begin_info.pClearValues = nullptr;
             cmd_clear[i]->beginRenderPass(renderpass_begin_info, vk::SubpassContents::eInline);
+            cmd_clear[i]->bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, descr_sets[0].get(), nullptr);
             cmd_clear[i]->bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
             cmd_clear[i]->draw(3, 1, 0, 0);
             cmd_clear[i]->endRenderPass();
@@ -473,9 +530,31 @@ int main()
         auto backbuffer = device->acquireNextImageKHR(*swapchain, UINT64_MAX, *backbuffer_semaphore, nullptr);
         if (backbuffer.result == vk::Result::eSuccess)
         {
+            static float angle = 0.f;
+            angle += glm::radians(5.f);
+            if (uniform_buffers_t* uniforms_ptr = reinterpret_cast<uniform_buffers_t*>(device->mapMemory(*uniform_mem, 0, VK_WHOLE_SIZE)))
+            {
+                float aspect = (float)surface_caps.currentExtent.height / (float)surface_caps.currentExtent.width;
+                uniforms_ptr->mvp = glm::ortho(-1.f, 1.f, -aspect, aspect) * glm::eulerAngleZ(angle);
+                uniforms_ptr->col.r = glm::sin(angle);
+                device->unmapMemory(*uniform_mem);
+            }
+
+            vk::UniqueSemaphore render_sem = device->createSemaphoreUnique({});
+            std::array<vk::PipelineStageFlags, 1> wait_stages{ vk::PipelineStageFlagBits::eColorAttachmentOutput };
+            vk::SubmitInfo submit_info;
+            submit_info.signalSemaphoreCount = 1;
+            submit_info.pSignalSemaphores = &render_sem.get();
+            submit_info.waitSemaphoreCount = 1;
+            submit_info.pWaitSemaphores = &backbuffer_semaphore.get();
+            submit_info.pWaitDstStageMask = wait_stages.data();
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &submit_commands[backbuffer.value];
+            q.submit(submit_info, nullptr);
+
             vk::PresentInfoKHR present_info;
             present_info.waitSemaphoreCount = 1;
-            present_info.pWaitSemaphores = &backbuffer_semaphore.get();
+            present_info.pWaitSemaphores = &render_sem.get();
             present_info.swapchainCount = 1;
             present_info.pSwapchains = &swapchain.get();
             present_info.pImageIndices = &backbuffer.value;
