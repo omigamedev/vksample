@@ -2,10 +2,13 @@
 
 static bool running = true;
 
+static vk::UniqueInstance instance;
+static vk::UniqueSurfaceKHR surface;
 static vk::UniqueDevice device;
 static vk::UniqueCommandPool cmdpool;
 static vk::UniqueDescriptorPool descrpool;
 
+static uint32_t device_family = 0;
 static vk::PhysicalDevice physical_device;
 static vk::Queue q;
 
@@ -23,6 +26,47 @@ LRESULT WINAPI main_window_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     }
     return DefWindowProc(hWnd, msg, wp, lp);
+}
+
+void find_device()
+{
+    uint32_t device_family = 0;
+    std::vector<vk::PhysicalDevice> physical_devices = instance->enumeratePhysicalDevices();
+    for (const auto& pd : physical_devices)
+    {
+        auto props = pd.getQueueFamilyProperties();
+        for (int family_index = 0; family_index < props.size(); family_index++)
+        {
+            bool support_graphics = (bool)(props[family_index].queueFlags & vk::QueueFlagBits::eGraphics);
+            bool support_present = pd.getSurfaceSupportKHR(family_index, *surface);
+            if (support_graphics && support_present)
+            {
+                std::array<const char*, 0> device_layers{
+                };
+                std::array<const char*, 1> device_extensions{
+                    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+                };
+                std::array<float, 1> queue_priorities{ 1.f };
+                vk::DeviceQueueCreateInfo queue_info;
+                queue_info.queueFamilyIndex = family_index;
+                queue_info.queueCount = 1;
+                queue_info.pQueuePriorities = queue_priorities.data();
+                vk::PhysicalDeviceFeatures device_features;
+                vk::DeviceCreateInfo device_info;
+                device_info.queueCreateInfoCount = 1;
+                device_info.pQueueCreateInfos = &queue_info;
+                device_info.enabledLayerCount = (uint32_t)device_layers.size();
+                device_info.ppEnabledLayerNames = device_layers.data();
+                device_info.enabledExtensionCount = (uint32_t)device_extensions.size();
+                device_info.ppEnabledExtensionNames = device_extensions.data();
+                device_info.pEnabledFeatures = &device_features;
+                device = pd.createDeviceUnique(device_info);
+                physical_device = pd;
+                device_family = family_index;
+                return;
+            }
+        }
+    }
 }
 
 uint32_t find_memory(const vk::MemoryRequirements& req, vk::MemoryPropertyFlags flags)
@@ -121,8 +165,6 @@ vk::UniqueShaderModule load_shader_module(const std::string& path)
 
 int main()
 {
-    //getchar();
-
     // Instance creation
 
     vk::ApplicationInfo instance_app_info;
@@ -130,6 +172,7 @@ int main()
     instance_app_info.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
     instance_app_info.pEngineName = "Custom";
     instance_app_info.engineVersion = VK_MAKE_VERSION(0, 1, 0);
+    instance_app_info.apiVersion = VK_VERSION_1_2;
     std::array<const char*, 1> instance_layers {
         "VK_LAYER_LUNARG_standard_validation",
     };
@@ -143,7 +186,7 @@ int main()
     instance_info.ppEnabledLayerNames = instance_layers.data();
     instance_info.enabledExtensionCount = (uint32_t)instance_extensions.size();
     instance_info.ppEnabledExtensionNames = instance_extensions.data();
-    vk::UniqueInstance instance = vk::createInstanceUnique(instance_info);
+    instance = vk::createInstanceUnique(instance_info);
 
     // Window/Surface creation
 
@@ -165,49 +208,12 @@ int main()
     vk::Win32SurfaceCreateInfoKHR surface_info;
     surface_info.hinstance = wc.hInstance;
     surface_info.hwnd = hWnd;
-    vk::UniqueSurfaceKHR surface = instance->createWin32SurfaceKHRUnique(surface_info);
+    surface = instance->createWin32SurfaceKHRUnique(surface_info);
 
     // Create device
 
-    uint32_t device_family = 0;
-    std::vector<vk::PhysicalDevice> physical_devices = instance->enumeratePhysicalDevices();
-    for (const auto& pd : physical_devices)
-    {
-        auto props = pd.getQueueFamilyProperties();
-        for (int family_index = 0; family_index < props.size(); family_index++)
-        {
-            bool support_graphics = (bool)(props[family_index].queueFlags & vk::QueueFlagBits::eGraphics);
-            bool support_present = pd.getSurfaceSupportKHR(family_index, *surface);
-            if (support_graphics && support_present)
-            {
-                std::array<const char*, 0> device_layers{
-                };
-                std::array<const char*, 1> device_extensions{
-                    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-                };
-                std::array<float, 1> queue_priorities{ 1.f };
-                vk::DeviceQueueCreateInfo queue_info;
-                queue_info.queueFamilyIndex = family_index;
-                queue_info.queueCount = 1;
-                queue_info.pQueuePriorities = queue_priorities.data();
-                vk::PhysicalDeviceFeatures device_features;
-                vk::DeviceCreateInfo device_info;
-                device_info.queueCreateInfoCount = 1;
-                device_info.pQueueCreateInfos = &queue_info;
-                device_info.enabledLayerCount = (uint32_t)device_layers.size();
-                device_info.ppEnabledLayerNames = device_layers.data();
-                device_info.enabledExtensionCount = (uint32_t)device_extensions.size();
-                device_info.ppEnabledExtensionNames = device_extensions.data();
-                device_info.pEnabledFeatures = &device_features;
-                device = pd.createDeviceUnique(device_info);
-                physical_device = pd;
-                device_family = family_index;
-            }
-        }
-    }
-
+    find_device();
     auto pd_props = physical_device.getProperties();
-    std::cout << "Device: " << pd_props.deviceName << "\n";
 
     // Create Swapchain
 
