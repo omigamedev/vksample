@@ -236,10 +236,11 @@ int main()
     
     q = device->getQueue(device_family, 0);
     cmdpool = device->createCommandPoolUnique({ {}, device_family });
-    std::array<vk::DescriptorPoolSize, 1> descrpool_sizes {
+    std::array<vk::DescriptorPoolSize, 2> descrpool_sizes {
         vk::DescriptorPoolSize{ vk::DescriptorType::eUniformBuffer, 2 },
+        vk::DescriptorPoolSize{ vk::DescriptorType::eInputAttachment, 1 },
     };
-    descrpool = device->createDescriptorPoolUnique({ {}, 1, (uint32_t)descrpool_sizes.size(), descrpool_sizes.data() });
+    descrpool = device->createDescriptorPoolUnique({ {}, 2, (uint32_t)descrpool_sizes.size(), descrpool_sizes.data() });
 
     // Load the image into a staging vulkan image
 
@@ -295,6 +296,49 @@ int main()
     pipeline_layout_info.pushConstantRangeCount = 0;
     vk::UniquePipelineLayout pipeline_layout = device->createPipelineLayoutUnique(pipeline_layout_info);
 
+    // Create PipelineLayout Composite
+
+    std::array<vk::DescriptorSetLayoutBinding, 1> descrset_comp_layout_bindings {
+        vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
+    };
+    vk::DescriptorSetLayoutCreateInfo descrset_comp_layout_info;
+    descrset_comp_layout_info.bindingCount = (uint32_t)descrset_comp_layout_bindings.size();
+    descrset_comp_layout_info.pBindings = descrset_comp_layout_bindings.data();
+    vk::UniqueDescriptorSetLayout descrset_comp_layout = device->createDescriptorSetLayoutUnique(descrset_comp_layout_info);
+    vk::PipelineLayoutCreateInfo pipeline_comp_layout_info;
+    pipeline_comp_layout_info.setLayoutCount = 1;
+    pipeline_comp_layout_info.pSetLayouts = &descrset_comp_layout.get();
+    pipeline_comp_layout_info.pushConstantRangeCount = 0;
+    vk::UniquePipelineLayout pipeline_comp_layout = device->createPipelineLayoutUnique(pipeline_comp_layout_info);
+
+    // Create gbuffer
+
+    vk::ImageCreateInfo gbuffer_pos_info;
+    gbuffer_pos_info.imageType = vk::ImageType::e2D;
+    gbuffer_pos_info.format = vk::Format::eR32G32B32A32Sfloat;
+    gbuffer_pos_info.extent = vk::Extent3D(surface_caps.currentExtent, 1);
+    gbuffer_pos_info.mipLevels = 1;
+    gbuffer_pos_info.arrayLayers = 1;
+    gbuffer_pos_info.samples = vk::SampleCountFlagBits::e1;
+    gbuffer_pos_info.tiling = vk::ImageTiling::eOptimal;
+    gbuffer_pos_info.usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eInputAttachment;
+    gbuffer_pos_info.initialLayout = vk::ImageLayout::eUndefined;
+    vk::UniqueImage gbuffer_pos = device->createImageUnique(gbuffer_pos_info);
+    vk::MemoryRequirements gbuffer_pos_mem_req = device->getImageMemoryRequirements(*gbuffer_pos);
+    uint32_t gbuffer_pos_mem_idx = find_memory(gbuffer_pos_mem_req, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    vk::UniqueDeviceMemory gbuffer_pos_mem = device->allocateMemoryUnique({ gbuffer_pos_mem_req.size, gbuffer_pos_mem_idx });
+    device->bindImageMemory(*gbuffer_pos, *gbuffer_pos_mem, 0);
+    vk::ImageViewCreateInfo gbuffer_pos_view_info;
+    gbuffer_pos_view_info.image = *gbuffer_pos;
+    gbuffer_pos_view_info.viewType = vk::ImageViewType::e2D;
+    gbuffer_pos_view_info.format = gbuffer_pos_info.format;
+    gbuffer_pos_view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    gbuffer_pos_view_info.subresourceRange.baseArrayLayer = 0;
+    gbuffer_pos_view_info.subresourceRange.baseMipLevel = 0;
+    gbuffer_pos_view_info.subresourceRange.layerCount = 1;
+    gbuffer_pos_view_info.subresourceRange.levelCount = 1;
+    vk::UniqueImageView gbuffer_pos_view = device->createImageViewUnique(gbuffer_pos_view_info);
+
     // Create DescriptorSets
 
     struct uniform_buffers_t
@@ -335,38 +379,84 @@ int main()
     };
     device->updateDescriptorSets(descr_sets_write, nullptr);
 
+    // Create DescriptorSets Composite
+
+    std::vector<vk::UniqueDescriptorSet> descr_sets_comp = device->allocateDescriptorSetsUnique({ *descrpool, 1, &descrset_comp_layout.get() });
+
+    std::array<vk::DescriptorImageInfo, 1> descr_sets_comp_buffer {
+        vk::DescriptorImageInfo(nullptr, *gbuffer_pos_view, vk::ImageLayout::eShaderReadOnlyOptimal),
+    };
+    std::array<vk::WriteDescriptorSet, 1> descr_sets_comp_write{
+        vk::WriteDescriptorSet(*descr_sets_comp[0], 0, 0, 1, vk::DescriptorType::eInputAttachment, &descr_sets_comp_buffer[0], nullptr, nullptr),
+    };
+    device->updateDescriptorSets(descr_sets_comp_write, nullptr);
+
     // Renderpass
 
-    vk::AttachmentDescription renderpass_attachment_color;
-    renderpass_attachment_color.format = swapchain_info.imageFormat;
-    renderpass_attachment_color.samples = vk::SampleCountFlagBits::e1;
-    renderpass_attachment_color.loadOp = vk::AttachmentLoadOp::eLoad;
-    renderpass_attachment_color.storeOp = vk::AttachmentStoreOp::eStore;
-    renderpass_attachment_color.stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
-    renderpass_attachment_color.stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
-    renderpass_attachment_color.initialLayout = vk::ImageLayout::eColorAttachmentOptimal;
-    renderpass_attachment_color.finalLayout = vk::ImageLayout::ePresentSrcKHR;
-    vk::AttachmentReference renderpass_ref_color;
-    renderpass_ref_color.attachment = 0;
-    renderpass_ref_color.layout = vk::ImageLayout::eColorAttachmentOptimal;
-    vk::SubpassDescription renderpass_subpass;
-    renderpass_subpass.pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
-    renderpass_subpass.colorAttachmentCount = 1;
-    renderpass_subpass.pColorAttachments = &renderpass_ref_color;
+    std::array<vk::AttachmentDescription, 2> renderpass_attachments;
+    // color buffer
+    renderpass_attachments[0].format = swapchain_info.imageFormat;
+    renderpass_attachments[0].samples = vk::SampleCountFlagBits::e1;
+    renderpass_attachments[0].loadOp = vk::AttachmentLoadOp::eLoad;
+    renderpass_attachments[0].storeOp = vk::AttachmentStoreOp::eStore;
+    renderpass_attachments[0].stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
+    renderpass_attachments[0].stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
+    renderpass_attachments[0].initialLayout = vk::ImageLayout::eColorAttachmentOptimal;
+    renderpass_attachments[0].finalLayout = vk::ImageLayout::ePresentSrcKHR;
+    // gbuffer pos
+    renderpass_attachments[1].format = gbuffer_pos_info.format;
+    renderpass_attachments[1].samples = vk::SampleCountFlagBits::e1;
+    renderpass_attachments[1].loadOp = vk::AttachmentLoadOp::eClear;
+    renderpass_attachments[1].storeOp = vk::AttachmentStoreOp::eDontCare;
+    renderpass_attachments[1].stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
+    renderpass_attachments[1].stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
+    renderpass_attachments[1].initialLayout = vk::ImageLayout::eUndefined;
+    renderpass_attachments[1].finalLayout = vk::ImageLayout::eColorAttachmentOptimal;
+    
+    std::array<vk::SubpassDescription, 2> renderpass_subpasses;
+    
+    std::array<vk::AttachmentReference, 1> renderpass_references_first;
+    renderpass_references_first[0].attachment = 1;
+    renderpass_references_first[0].layout = vk::ImageLayout::eColorAttachmentOptimal;
+    renderpass_subpasses[0].pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
+    renderpass_subpasses[0].colorAttachmentCount = (uint32_t)renderpass_references_first.size();
+    renderpass_subpasses[0].pColorAttachments = renderpass_references_first.data();
+
+    std::array<vk::AttachmentReference, 1> renderpass_references_second;
+    renderpass_references_second[0].attachment = 0;
+    renderpass_references_second[0].layout = vk::ImageLayout::eColorAttachmentOptimal;
+    std::array<vk::AttachmentReference, 1> renderpass_references_second_input;
+    renderpass_references_second_input[0].attachment = 1;
+    renderpass_references_second_input[0].layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    renderpass_subpasses[1].pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
+    renderpass_subpasses[1].colorAttachmentCount = (uint32_t)renderpass_references_second.size();
+    renderpass_subpasses[1].pColorAttachments = renderpass_references_second.data();
+    renderpass_subpasses[1].inputAttachmentCount = (uint32_t)renderpass_references_second_input.size();
+    renderpass_subpasses[1].pInputAttachments = renderpass_references_second_input.data();
+
+    std::array<vk::SubpassDependency, 1> renderpass_deps;
+    renderpass_deps[0].srcSubpass = 0;
+    renderpass_deps[0].dstSubpass = 1;
+    renderpass_deps[0].srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+    renderpass_deps[0].dstStageMask = vk::PipelineStageFlagBits::eFragmentShader;
+    renderpass_deps[0].srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
+    renderpass_deps[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
+    renderpass_deps[0].dependencyFlags = vk::DependencyFlagBits::eByRegion;
+
     vk::RenderPassCreateInfo renderpass_info;
-    renderpass_info.attachmentCount = 1;
-    renderpass_info.pAttachments = &renderpass_attachment_color;
-    renderpass_info.subpassCount = 1;
-    renderpass_info.pSubpasses = &renderpass_subpass;
-    renderpass_info.dependencyCount = 0;
-    renderpass_info.pDependencies = nullptr;
+    renderpass_info.attachmentCount = (uint32_t)renderpass_attachments.size();
+    renderpass_info.pAttachments = renderpass_attachments.data();
+    renderpass_info.subpassCount = (uint32_t)renderpass_subpasses.size();
+    renderpass_info.pSubpasses = renderpass_subpasses.data();
+    renderpass_info.dependencyCount = (uint32_t)renderpass_deps.size();
+    renderpass_info.pDependencies = renderpass_deps.data();
     vk::UniqueRenderPass renderpass = device->createRenderPassUnique(renderpass_info);
 
     // Create Pipeline
 
     vk::UniqueShaderModule module_triangle_vert = load_shader_module("shaders/triangle.vert.spv");
     vk::UniqueShaderModule module_triangle_frag = load_shader_module("shaders/triangle.frag.spv");
-    std::array<vk::PipelineShaderStageCreateInfo, 2> pipeline_stages{
+    std::array<vk::PipelineShaderStageCreateInfo, 2> pipeline_stages {
         vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eVertex, *module_triangle_vert, "main"),
         vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eFragment, *module_triangle_frag, "main"),
     };
@@ -428,6 +518,23 @@ int main()
 
     vk::UniquePipeline pipeline = device->createGraphicsPipelineUnique(nullptr, pipeline_info);
 
+    // Create Composite Pipeline
+
+    vk::UniqueShaderModule module_composite_vert = load_shader_module("shaders/composite.vert.spv");
+    vk::UniqueShaderModule module_composite_frag = load_shader_module("shaders/composite.frag.spv");
+    std::array<vk::PipelineShaderStageCreateInfo, 2> pipeline_stages_composite {
+        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eVertex, * module_composite_vert, "main"),
+        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eFragment, * module_composite_frag, "main"),
+    };
+
+    pipeline_info.stageCount = (uint32_t)pipeline_stages_composite.size();
+    pipeline_info.pStages = pipeline_stages_composite.data();
+    pipeline_info.layout = *pipeline_comp_layout;
+    pipeline_info.subpass = 1;
+
+    vk::UniquePipeline pipeline_comp = device->createGraphicsPipelineUnique(nullptr, pipeline_info);
+
+
     // Create clear screen command
 
     vk::CommandBufferAllocateInfo cmd_clear_info;
@@ -486,26 +593,39 @@ int main()
             view_info.subresourceRange.layerCount = 1;
             view_info.subresourceRange.levelCount = 1;
             swapchain_views[i] = device->createImageViewUnique(view_info);
+            std::array<vk::ImageView, 2> framebuffer_attachments{ *swapchain_views[i], *gbuffer_pos_view };
             vk::FramebufferCreateInfo framebuffer_info;
             framebuffer_info.renderPass = *renderpass;
-            framebuffer_info.attachmentCount = 1;
-            framebuffer_info.pAttachments = &swapchain_views[i].get();
+            framebuffer_info.attachmentCount = (uint32_t)framebuffer_attachments.size();
+            framebuffer_info.pAttachments = framebuffer_attachments.data();
             framebuffer_info.width = surface_caps.currentExtent.width;
             framebuffer_info.height = surface_caps.currentExtent.height;
             framebuffer_info.layers = 1;
             framebuffers[i] = device->createFramebufferUnique(framebuffer_info);
 
+            std::array<vk::ClearValue, 2> clear_values {
+                vk::ClearValue(),
+                vk::ClearColorValue({ std::array<float,4>{1, 0, 1, 1} }),
+            };
             vk::RenderPassBeginInfo renderpass_begin_info;
             renderpass_begin_info.renderPass = *renderpass;
             renderpass_begin_info.framebuffer = *framebuffers[i];
             renderpass_begin_info.renderArea.extent = surface_caps.currentExtent;
             renderpass_begin_info.renderArea.offset = {};
-            renderpass_begin_info.clearValueCount = 0;
-            renderpass_begin_info.pClearValues = nullptr;
+            renderpass_begin_info.clearValueCount = (uint32_t)clear_values.size();
+            renderpass_begin_info.pClearValues = clear_values.data();
             cmd_clear[i]->beginRenderPass(renderpass_begin_info, vk::SubpassContents::eInline);
-            cmd_clear[i]->bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, descr_sets[0].get(), nullptr);
-            cmd_clear[i]->bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-            cmd_clear[i]->draw(3, 1, 0, 0);
+            {
+                cmd_clear[i]->bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, descr_sets[0].get(), nullptr);
+                cmd_clear[i]->bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+                cmd_clear[i]->draw(3, 1, 0, 0);
+            }
+            cmd_clear[i]->nextSubpass(vk::SubpassContents::eInline);
+            {
+                cmd_clear[i]->bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_comp_layout, 0, descr_sets_comp[0].get(), nullptr);
+                cmd_clear[i]->bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline_comp);
+                cmd_clear[i]->draw(6, 1, 0, 0);
+            }
             cmd_clear[i]->endRenderPass();
 
             //vk::ClearColorValue clear_color = std::array<float, 4>({ 1, 0, 1, 1 });
