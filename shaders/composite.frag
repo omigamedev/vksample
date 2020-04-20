@@ -6,5 +6,5 @@ layout (location = 0) out vec4 out_color;
 void main()
 {
 	vec4 pos = subpassLoad(gbuf_pos);
-    out_color = vec4(pos.rgb * 0.2, pos.a);
+    out_color = vec4(pos.rgb, pos.a);
 }

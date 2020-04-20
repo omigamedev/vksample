@@ -19,6 +19,7 @@
   </ItemGroup>
   <ItemGroup>
     <Library Include="C:\VulkanSDK\1.2.131.2\Lib\vulkan-1.lib" />
+    <Library Include="libs\assimp\out\install\x64-Release\lib\assimp-vc142-mt.lib" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\pch.h" />
@@ -35,6 +36,11 @@
       <OutputItemType Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CopyFileToFolders</OutputItemType>
       <TreatOutputAsContent Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</TreatOutputAsContent>
     </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <CopyFileToFolders Include="libs\assimp\out\install\x64-Release\bin\assimp-vc142-mt.dll">
+      <FileType>Document</FileType>
+    </CopyFileToFolders>
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>16.0</VCProjectVersion>

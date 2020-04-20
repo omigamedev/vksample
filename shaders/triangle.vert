@@ -1,14 +1,9 @@
 #version 450
 
-const vec2 vertices[3] = {
-    { 0.0, -0.5},
-    {-0.5,  0.5},
-    { 0.5,  0.5},
-};
-
+layout (location = 0) in vec3 v_pos;
 layout (binding = 0) uniform ubo_t { mat4 mvp; } ubo;
 
 void main()
 {
-    gl_Position = ubo.mvp * vec4(vertices[gl_VertexIndex], 0, 1);
+    gl_Position = ubo.mvp * vec4(v_pos, 1);
 }

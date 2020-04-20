@@ -452,6 +452,71 @@ int main()
     renderpass_info.pDependencies = renderpass_deps.data();
     vk::UniqueRenderPass renderpass = device->createRenderPassUnique(renderpass_info);
 
+    // Load 3D model
+
+    struct vertex_t
+    {
+        glm::vec3 pos;
+        vertex_t() = default;
+        vertex_t(glm::vec2 pos) : pos(glm::vec3(pos, 0)) {}
+    };
+
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile("D:\\3D\\buildings.fbx", aiProcessPreset_TargetRealtime_Fast);
+
+    std::vector<vertex_t> mesh_vert;
+    std::vector<uint32_t> mesh_idx;
+    auto m = scene->mMeshes[1];
+    for (uint32_t i = 0; i < m->mNumVertices; i++)
+    {
+        vertex_t v;
+        v.pos.x = m->mVertices[i].x;
+        v.pos.y = m->mVertices[i].y;
+        v.pos.z = m->mVertices[i].z;
+        mesh_vert.push_back(v);
+    }
+
+    for (uint32_t i = 0; i < scene->mMeshes[0]->mNumFaces; i++)
+    {
+        for (int v = 0; v < 3; v++)
+        {
+            mesh_idx.push_back(m->mFaces[i].mIndices[v]);
+        }
+    }
+
+    // vertex buffer
+    vk::BufferCreateInfo triangle_buffer_info;
+    triangle_buffer_info.size = mesh_vert.size() * sizeof(vertex_t);
+    triangle_buffer_info.usage = vk::BufferUsageFlagBits::eVertexBuffer;
+    vk::UniqueBuffer triangle_buffer = device->createBufferUnique(triangle_buffer_info);
+    vk::MemoryRequirements triangle_buffer_mem_req = device->getBufferMemoryRequirements(*triangle_buffer);
+    uint32_t triangle_buffer_mem_idx = find_memory(triangle_buffer_mem_req,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    vk::UniqueDeviceMemory triangle_buffer_mem = device->allocateMemoryUnique({ triangle_buffer_mem_req.size, triangle_buffer_mem_idx });
+    device->bindBufferMemory(*triangle_buffer, *triangle_buffer_mem, 0);
+    if (auto* ptr = reinterpret_cast<vertex_t*>(device->mapMemory(*triangle_buffer_mem, 0, VK_WHOLE_SIZE)))
+    {
+        std::copy(mesh_vert.begin(), mesh_vert.end(), ptr);
+        device->unmapMemory(*triangle_buffer_mem);
+    }
+
+    // index buffer
+    vk::BufferCreateInfo triangle_buffer_idx_info;
+    triangle_buffer_idx_info.size = mesh_idx.size() * sizeof(uint32_t);
+    triangle_buffer_idx_info.usage = vk::BufferUsageFlagBits::eIndexBuffer;
+    vk::UniqueBuffer triangle_buffer_idx = device->createBufferUnique(triangle_buffer_idx_info);
+    vk::MemoryRequirements triangle_buffer_idx_mem_req = device->getBufferMemoryRequirements(*triangle_buffer_idx);
+    uint32_t triangle_buffer_idx_mem_idx = find_memory(triangle_buffer_idx_mem_req,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    vk::UniqueDeviceMemory triangle_buffer_idx_mem = device->allocateMemoryUnique({ triangle_buffer_idx_mem_req.size, triangle_buffer_idx_mem_idx });
+    device->bindBufferMemory(*triangle_buffer_idx, *triangle_buffer_idx_mem, 0);
+    if (auto* ptr = reinterpret_cast<uint32_t*>(device->mapMemory(*triangle_buffer_idx_mem, 0, VK_WHOLE_SIZE)))
+    {
+        std::copy(mesh_idx.begin(), mesh_idx.end(), ptr);
+        device->unmapMemory(*triangle_buffer_idx_mem);
+    }
+
+
     // Create Pipeline
 
     vk::UniqueShaderModule module_triangle_vert = load_shader_module("shaders/triangle.vert.spv");
@@ -461,7 +526,17 @@ int main()
         vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eFragment, *module_triangle_frag, "main"),
     };
 
+    std::array<vk::VertexInputBindingDescription, 1> pipeline_input_bindings{
+        vk::VertexInputBindingDescription(0, sizeof(vertex_t), vk::VertexInputRate::eVertex),
+    };
+    std::array<vk::VertexInputAttributeDescription, 1> pipeline_input_attributes{
+        vk::VertexInputAttributeDescription(0, 0, vk::Format::eR32G32B32Sfloat, offsetof(vertex_t, pos)),
+    };
     vk::PipelineVertexInputStateCreateInfo pipeline_input;
+    pipeline_input.vertexBindingDescriptionCount = (uint32_t)pipeline_input_bindings.size();
+    pipeline_input.pVertexBindingDescriptions = pipeline_input_bindings.data();
+    pipeline_input.vertexAttributeDescriptionCount = (uint32_t)pipeline_input_attributes.size();
+    pipeline_input.pVertexAttributeDescriptions = pipeline_input_attributes.data();
 
     vk::PipelineInputAssemblyStateCreateInfo pipeline_assembly;
     pipeline_assembly.topology = vk::PrimitiveTopology::eTriangleList;
@@ -527,8 +602,11 @@ int main()
         vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eFragment, * module_composite_frag, "main"),
     };
 
+    vk::PipelineVertexInputStateCreateInfo pipeline_input_comp;
+
     pipeline_info.stageCount = (uint32_t)pipeline_stages_composite.size();
     pipeline_info.pStages = pipeline_stages_composite.data();
+    pipeline_info.pVertexInputState = &pipeline_input_comp;
     pipeline_info.layout = *pipeline_comp_layout;
     pipeline_info.subpass = 1;
 
@@ -616,9 +694,11 @@ int main()
             renderpass_begin_info.pClearValues = clear_values.data();
             cmd_clear[i]->beginRenderPass(renderpass_begin_info, vk::SubpassContents::eInline);
             {
+                cmd_clear[i]->bindVertexBuffers(0, *triangle_buffer, { 0 });
+                cmd_clear[i]->bindIndexBuffer(*triangle_buffer_idx, 0, vk::IndexType::eUint32);
                 cmd_clear[i]->bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, descr_sets[0].get(), nullptr);
                 cmd_clear[i]->bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-                cmd_clear[i]->draw(3, 1, 0, 0);
+                cmd_clear[i]->drawIndexed((uint32_t)mesh_idx.size(), 1, 0, 0, 0);
             }
             cmd_clear[i]->nextSubpass(vk::SubpassContents::eInline);
             {
@@ -660,8 +740,11 @@ int main()
             angle += glm::radians(5.f);
             if (uniform_buffers_t* uniforms_ptr = reinterpret_cast<uniform_buffers_t*>(device->mapMemory(*uniform_mem, 0, VK_WHOLE_SIZE)))
             {
-                float aspect = (float)surface_caps.currentExtent.height / (float)surface_caps.currentExtent.width;
-                uniforms_ptr->mvp = glm::ortho(-1.f, 1.f, -aspect, aspect) * glm::eulerAngleZ(angle);
+                float aspect = (float)surface_caps.currentExtent.width / (float)surface_caps.currentExtent.height;
+                uniforms_ptr->mvp = glm::perspective(glm::radians(85.f), aspect, .1f, 100.f) *
+                    glm::lookAt(glm::vec3(0, -2, 5), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0)) * 
+                    glm::scale(glm::vec3(.05f)) *
+                    glm::eulerAngleY(angle);
                 uniforms_ptr->col.r = glm::sin(angle);
                 device->unmapMemory(*uniform_mem);
             }
