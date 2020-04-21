@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "debug_message.h"
 
 static bool running = true;
 
@@ -177,9 +178,11 @@ int main()
         "VK_LAYER_LUNARG_standard_validation",
         "VK_LAYER_RENDERDOC_Capture",
     };
-    std::array<const char*, 2> instance_extensions{
+    std::array<const char*, 4> instance_extensions{
         VK_KHR_SURFACE_EXTENSION_NAME,
         VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
+        VK_EXT_DEBUG_REPORT_EXTENSION_NAME,
     };
     vk::InstanceCreateInfo instance_info;
     instance_info.pApplicationInfo = &instance_app_info;
@@ -188,6 +191,10 @@ int main()
     instance_info.enabledExtensionCount = (uint32_t)instance_extensions.size();
     instance_info.ppEnabledExtensionNames = instance_extensions.data();
     instance = vk::createInstanceUnique(instance_info);
+
+    // Debugging
+    
+    init_debug_message(instance);
 
     // Window/Surface creation
 
@@ -338,7 +345,7 @@ int main()
     cmdpool = device->createCommandPoolUnique({ {}, device_family });
     std::array<vk::DescriptorPoolSize, 2> descrpool_sizes {
         vk::DescriptorPoolSize{ vk::DescriptorType::eUniformBuffer, (uint32_t)nodes.size() * 2 },
-        vk::DescriptorPoolSize{ vk::DescriptorType::eInputAttachment, 1 },
+        vk::DescriptorPoolSize{ vk::DescriptorType::eInputAttachment, 2 },
     };
     descrpool = device->createDescriptorPoolUnique({ {}, (uint32_t)nodes.size() + 1, 
         (uint32_t)descrpool_sizes.size(), descrpool_sizes.data() });
@@ -399,8 +406,9 @@ int main()
 
     // Create PipelineLayout Composite
 
-    std::array<vk::DescriptorSetLayoutBinding, 1> descrset_comp_layout_bindings {
+    std::array<vk::DescriptorSetLayoutBinding, 2> descrset_comp_layout_bindings {
         vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
+        vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
     };
     vk::DescriptorSetLayoutCreateInfo descrset_comp_layout_info;
     descrset_comp_layout_info.bindingCount = (uint32_t)descrset_comp_layout_bindings.size();
@@ -451,7 +459,7 @@ int main()
     depth_info.arrayLayers = 1;
     depth_info.samples = vk::SampleCountFlagBits::e1;
     depth_info.tiling = vk::ImageTiling::eOptimal; // check support
-    depth_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    depth_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eInputAttachment;
     depth_info.initialLayout = vk::ImageLayout::eUndefined;
     vk::UniqueImage depth = device->createImageUnique(depth_info);
     vk::MemoryRequirements depth_mem_req = device->getImageMemoryRequirements(*depth);
@@ -517,10 +525,14 @@ int main()
     std::vector<vk::UniqueDescriptorSet> descr_sets_comp = 
         device->allocateDescriptorSetsUnique({ *descrpool, 1, &descrset_comp_layout.get() });
 
-    vk::DescriptorImageInfo descr_sets_comp_buffer(nullptr, *gbuffer_pos_view, 
-        vk::ImageLayout::eShaderReadOnlyOptimal);
-    vk::WriteDescriptorSet descr_sets_comp_write(*descr_sets_comp[0], 0, 0, 1, 
-        vk::DescriptorType::eInputAttachment, &descr_sets_comp_buffer, nullptr, nullptr);
+    vk::DescriptorImageInfo descr_sets_comp_gbuf(nullptr, *gbuffer_pos_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+    vk::DescriptorImageInfo descr_sets_comp_depth(nullptr, *depth_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+    std::array<vk::WriteDescriptorSet, 2> descr_sets_comp_write{
+        vk::WriteDescriptorSet(*descr_sets_comp[0], 0, 0, 1,
+            vk::DescriptorType::eInputAttachment, &descr_sets_comp_gbuf, nullptr, nullptr),
+        vk::WriteDescriptorSet(*descr_sets_comp[0], 1, 0, 1,
+            vk::DescriptorType::eInputAttachment, &descr_sets_comp_depth, nullptr, nullptr),
+    };
     device->updateDescriptorSets(descr_sets_comp_write, nullptr);
 
     // Renderpass
@@ -570,16 +582,19 @@ int main()
     std::array<vk::AttachmentReference, 1> renderpass_references_second;
     renderpass_references_second[0].attachment = 0;
     renderpass_references_second[0].layout = vk::ImageLayout::eColorAttachmentOptimal;
-    std::array<vk::AttachmentReference, 1> renderpass_references_second_input;
+    std::array<vk::AttachmentReference, 2> renderpass_references_second_input;
     renderpass_references_second_input[0].attachment = 1;
     renderpass_references_second_input[0].layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    renderpass_references_second_input[1].attachment = 2;
+    renderpass_references_second_input[1].layout = vk::ImageLayout::eShaderReadOnlyOptimal;
     renderpass_subpasses[1].pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
     renderpass_subpasses[1].colorAttachmentCount = (uint32_t)renderpass_references_second.size();
     renderpass_subpasses[1].pColorAttachments = renderpass_references_second.data();
     renderpass_subpasses[1].inputAttachmentCount = (uint32_t)renderpass_references_second_input.size();
     renderpass_subpasses[1].pInputAttachments = renderpass_references_second_input.data();
 
-    std::array<vk::SubpassDependency, 1> renderpass_deps;
+    std::array<vk::SubpassDependency, 2> renderpass_deps;
+    // gbuffer
     renderpass_deps[0].srcSubpass = 0;
     renderpass_deps[0].dstSubpass = 1;
     renderpass_deps[0].srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput;
@@ -587,6 +602,14 @@ int main()
     renderpass_deps[0].srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
     renderpass_deps[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
     renderpass_deps[0].dependencyFlags = vk::DependencyFlagBits::eByRegion;
+    // depth
+    renderpass_deps[1].srcSubpass = 0;
+    renderpass_deps[1].dstSubpass = 1;
+    renderpass_deps[1].srcStageMask = vk::PipelineStageFlagBits::eLateFragmentTests;
+    renderpass_deps[1].dstStageMask = vk::PipelineStageFlagBits::eFragmentShader;
+    renderpass_deps[1].srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite;
+    renderpass_deps[1].dstAccessMask = vk::AccessFlagBits::eShaderRead;
+    renderpass_deps[1].dependencyFlags = vk::DependencyFlagBits::eByRegion;
 
     vk::RenderPassCreateInfo renderpass_info;
     renderpass_info.attachmentCount = (uint32_t)renderpass_attachments.size();
@@ -771,7 +794,7 @@ int main()
 
             std::array<vk::ClearValue, 3> clear_values{
                 vk::ClearValue(),
-                vk::ClearColorValue({ std::array<float,4>{1, 0, 1, 1} }),
+                vk::ClearColorValue({ std::array<float,4>{1, 0, 1, 0} }),
                 vk::ClearDepthStencilValue(1.f, 0),
             };
             vk::RenderPassBeginInfo renderpass_begin_info;

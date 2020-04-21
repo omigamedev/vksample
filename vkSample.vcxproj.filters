@@ -37,6 +37,9 @@
     <ClCompile Include="libs\fmt\src\os.cc">
       <Filter>Libs\fmt</Filter>
     </ClCompile>
+    <ClCompile Include="src\debug_message.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Library Include="C:\VulkanSDK\1.2.131.2\Lib\vulkan-1.lib">
@@ -50,8 +53,20 @@
     <ClInclude Include="src\pch.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="src\debug_message.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
+    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
+    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
     <CustomBuild Include="shaders\*.frag;shaders\*.vert">
       <Filter>Shaders</Filter>
     </CustomBuild>
