@@ -20,6 +20,9 @@
       <UniqueIdentifier>{77e9a041-6124-41ec-b8a0-9d1678f689d2}</UniqueIdentifier>
       <Extensions>vert;frag</Extensions>
     </Filter>
+    <Filter Include="Libs\fmt">
+      <UniqueIdentifier>{97957435-7882-43a5-b77d-1e558649d610}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp">
@@ -27,6 +30,12 @@
     </ClCompile>
     <ClCompile Include="src\pch.cpp">
       <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="libs\fmt\src\format.cc">
+      <Filter>Libs\fmt</Filter>
+    </ClCompile>
+    <ClCompile Include="libs\fmt\src\os.cc">
+      <Filter>Libs\fmt</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -43,10 +52,13 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <CustomBuild Include="shaders\triangle.frag">
+    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
       <Filter>Shaders</Filter>
     </CustomBuild>
-    <CustomBuild Include="shaders\triangle.vert">
+    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
+    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
       <Filter>Shaders</Filter>
     </CustomBuild>
     <CustomBuild Include="shaders\*.frag;shaders\*.vert">

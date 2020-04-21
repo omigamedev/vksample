@@ -173,8 +173,9 @@ int main()
     instance_app_info.pEngineName = "Custom";
     instance_app_info.engineVersion = VK_MAKE_VERSION(0, 1, 0);
     instance_app_info.apiVersion = VK_VERSION_1_2;
-    std::array<const char*, 1> instance_layers {
+    std::array<const char*, 2> instance_layers {
         "VK_LAYER_LUNARG_standard_validation",
+        "VK_LAYER_RENDERDOC_Capture",
     };
     std::array<const char*, 2> instance_extensions{
         VK_KHR_SURFACE_EXTENSION_NAME,
@@ -214,6 +215,8 @@ int main()
 
     find_device();
     auto pd_props = physical_device.getProperties();
+    std::string title = fmt::format("VulkanSample - {}", pd_props.deviceName);
+    SetWindowTextA(hWnd, title.c_str());
 
     // Create Swapchain
 
@@ -232,15 +235,111 @@ int main()
     vk::UniqueSwapchainKHR swapchain = device->createSwapchainKHRUnique(swapchain_info);
     std::vector<vk::Image> swapchain_images = device->getSwapchainImagesKHR(*swapchain);
 
+    // Load 3D model
+
+    struct vertex_t
+    {
+        glm::vec3 pos;
+        glm::vec3 nor;
+        vertex_t() = default;
+        vertex_t(glm::vec3 pos) : pos(pos) {}
+        vertex_t(glm::vec2 pos) : pos(glm::vec3(pos, 0)) {}
+    };
+
+    struct mesh_t
+    {
+        uint32_t vtx_offset;
+        uint32_t idx_offset;
+        uint32_t idx_count;
+    };
+
+    struct node_t
+    {
+        std::vector<uint32_t> mesh_indices;
+        glm::mat4 mat;
+        glm::vec3 col;
+    };
+
+    std::vector<vertex_t> mesh_data_vert;
+    std::vector<uint32_t> mesh_data_idx;
+
+    Assimp::Importer importer;
+    const aiScene* scene = importer.ReadFile("D:\\3D\\buildings.fbx", aiProcessPreset_TargetRealtime_Fast);
+    std::vector<mesh_t> meshes;
+    for (uint32_t mesh_index = 0; mesh_index < scene->mNumMeshes; mesh_index++)
+    {
+        aiMesh* scene_mesh = scene->mMeshes[mesh_index];
+        mesh_t& mesh = meshes.emplace_back();
+        mesh.idx_offset = (uint32_t)mesh_data_idx.size();
+        mesh.idx_count = scene_mesh->mNumFaces * 3;
+        mesh.vtx_offset = (uint32_t)mesh_data_vert.size();
+        for (uint32_t vertex_index = 0; vertex_index < scene_mesh->mNumVertices; vertex_index++)
+        {
+            glm::vec3 pos = glm::make_vec3(&scene_mesh->mVertices[vertex_index].x);
+            mesh_data_vert.emplace_back(pos);
+        }
+        for (uint32_t face_index = 0; face_index < scene_mesh->mNumFaces; face_index++)
+        {
+            mesh_data_idx.insert(mesh_data_idx.end(), 
+                scene_mesh->mFaces[face_index].mIndices, 
+                scene_mesh->mFaces[face_index].mIndices + 3);
+        }
+    }
+    std::vector<node_t> nodes;
+    for (uint32_t node_index = 0; node_index < scene->mRootNode->mNumChildren; node_index++)
+    {
+        aiNode* scene_node = scene->mRootNode->mChildren[node_index];
+        node_t& node = nodes.emplace_back();
+        node.col = glm::linearRand(glm::vec3(0), glm::vec3(1));
+        node.mat = glm::identity<glm::mat4>();
+        //std::copy_n(scene_node->mTransformation[0], 16, glm::value_ptr(node.mat));
+        node.mesh_indices.insert(node.mesh_indices.end(), 
+            scene_node->mMeshes, 
+            scene_node->mMeshes + scene_node->mNumMeshes);
+    }
+
+    // vertex buffer
+    vk::BufferCreateInfo triangle_buffer_info;
+    triangle_buffer_info.size = mesh_data_vert.size() * sizeof(vertex_t);
+    triangle_buffer_info.usage = vk::BufferUsageFlagBits::eVertexBuffer;
+    vk::UniqueBuffer triangle_buffer = device->createBufferUnique(triangle_buffer_info);
+    vk::MemoryRequirements triangle_buffer_mem_req = device->getBufferMemoryRequirements(*triangle_buffer);
+    uint32_t triangle_buffer_mem_idx = find_memory(triangle_buffer_mem_req,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    vk::UniqueDeviceMemory triangle_buffer_mem = device->allocateMemoryUnique({ triangle_buffer_mem_req.size, triangle_buffer_mem_idx });
+    device->bindBufferMemory(*triangle_buffer, *triangle_buffer_mem, 0);
+    if (auto* ptr = reinterpret_cast<vertex_t*>(device->mapMemory(*triangle_buffer_mem, 0, VK_WHOLE_SIZE)))
+    {
+        std::copy(mesh_data_vert.begin(), mesh_data_vert.end(), ptr);
+        device->unmapMemory(*triangle_buffer_mem);
+    }
+
+    // index buffer
+    vk::BufferCreateInfo triangle_buffer_idx_info;
+    triangle_buffer_idx_info.size = mesh_data_idx.size() * sizeof(uint32_t);
+    triangle_buffer_idx_info.usage = vk::BufferUsageFlagBits::eIndexBuffer;
+    vk::UniqueBuffer triangle_buffer_idx = device->createBufferUnique(triangle_buffer_idx_info);
+    vk::MemoryRequirements triangle_buffer_idx_mem_req = device->getBufferMemoryRequirements(*triangle_buffer_idx);
+    uint32_t triangle_buffer_idx_mem_idx = find_memory(triangle_buffer_idx_mem_req,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    vk::UniqueDeviceMemory triangle_buffer_idx_mem = device->allocateMemoryUnique({ triangle_buffer_idx_mem_req.size, triangle_buffer_idx_mem_idx });
+    device->bindBufferMemory(*triangle_buffer_idx, *triangle_buffer_idx_mem, 0);
+    if (auto* ptr = reinterpret_cast<uint32_t*>(device->mapMemory(*triangle_buffer_idx_mem, 0, VK_WHOLE_SIZE)))
+    {
+        std::copy(mesh_data_idx.begin(), mesh_data_idx.end(), ptr);
+        device->unmapMemory(*triangle_buffer_idx_mem);
+    }
+
     // Create useful global objects
     
     q = device->getQueue(device_family, 0);
     cmdpool = device->createCommandPoolUnique({ {}, device_family });
     std::array<vk::DescriptorPoolSize, 2> descrpool_sizes {
-        vk::DescriptorPoolSize{ vk::DescriptorType::eUniformBuffer, 2 },
+        vk::DescriptorPoolSize{ vk::DescriptorType::eUniformBuffer, (uint32_t)nodes.size() * 2 },
         vk::DescriptorPoolSize{ vk::DescriptorType::eInputAttachment, 1 },
     };
-    descrpool = device->createDescriptorPoolUnique({ {}, 2, (uint32_t)descrpool_sizes.size(), descrpool_sizes.data() });
+    descrpool = device->createDescriptorPoolUnique({ {}, (uint32_t)nodes.size() + 1, 
+        (uint32_t)descrpool_sizes.size(), descrpool_sizes.data() });
 
     // Load the image into a staging vulkan image
 
@@ -344,16 +443,13 @@ int main()
     struct uniform_buffers_t
     {
         glm::mat4 mvp;
-        uint8_t pad[0x100 - sizeof(mvp)]; // alignment
+        uint8_t pad0[0x100 - sizeof(mvp)]; // alignment
         glm::vec4 col;
+        uint8_t pad1[0x100 - sizeof(col)]; // alignment
     };
 
-    uniform_buffers_t uniforms;
-    uniforms.col = glm::vec4(0, 1, 0, 1);
-    uniforms.mvp = glm::eulerAngleZ(glm::radians(45.f));
-
     vk::BufferCreateInfo uniform_buffer_info;
-    uniform_buffer_info.size = sizeof(uniform_buffers_t);
+    uniform_buffer_info.size = sizeof(uniform_buffers_t) * nodes.size();
     uniform_buffer_info.usage = vk::BufferUsageFlagBits::eUniformBuffer;
     vk::UniqueBuffer uniform_buffer = device->createBufferUnique(uniform_buffer_info);
     vk::MemoryRequirements uniform_mem_req = device->getBufferMemoryRequirements(*uniform_buffer);
@@ -361,34 +457,39 @@ int main()
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
     vk::UniqueDeviceMemory uniform_mem = device->allocateMemoryUnique({ uniform_mem_req.size, uniform_mem_idx });
     device->bindBufferMemory(*uniform_buffer, *uniform_mem, 0);
-    if (uniform_buffers_t* uniforms_ptr = reinterpret_cast<uniform_buffers_t*>(device->mapMemory(*uniform_mem, 0, VK_WHOLE_SIZE)))
-    {
-        *uniforms_ptr = uniforms;
-        device->unmapMemory(*uniform_mem);
-    }
 
-    std::vector<vk::UniqueDescriptorSet> descr_sets = device->allocateDescriptorSetsUnique({ *descrpool, 1, &descrset_layout.get() });
+    std::vector<vk::DescriptorSetLayout> descr_sets_layouts(nodes.size(), *descrset_layout);
+    std::vector<vk::UniqueDescriptorSet> descr_sets = device->allocateDescriptorSetsUnique({ *descrpool, 
+        (uint32_t)descr_sets_layouts.size(), descr_sets_layouts.data() });
     
-    std::array<vk::DescriptorBufferInfo, 2> descr_sets_buffer{
-        vk::DescriptorBufferInfo(*uniform_buffer, offsetof(uniform_buffers_t, mvp), sizeof(uniform_buffers_t::mvp)),
-        vk::DescriptorBufferInfo(*uniform_buffer, offsetof(uniform_buffers_t, col), sizeof(uniform_buffers_t::col)),
-    };
-    std::array<vk::WriteDescriptorSet, 2> descr_sets_write{
-        vk::WriteDescriptorSet(*descr_sets[0], 0, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &descr_sets_buffer[0], nullptr),
-        vk::WriteDescriptorSet(*descr_sets[0], 1, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &descr_sets_buffer[1], nullptr),
-    };
+    std::vector<vk::DescriptorBufferInfo> descr_sets_buffer;
+    std::vector<vk::WriteDescriptorSet> descr_sets_write;
+    descr_sets_buffer.reserve(nodes.size() * 2);
+    descr_sets_write.reserve(nodes.size() * 2);
+    for (uint32_t node_index = 0; node_index < nodes.size(); node_index++)
+    {
+        vk::DeviceSize buffer_offset = node_index * sizeof(uniform_buffers_t);
+        descr_sets_buffer.emplace_back(*uniform_buffer, 
+            buffer_offset + offsetof(uniform_buffers_t, mvp), sizeof(uniform_buffers_t::mvp));
+        descr_sets_write.emplace_back(*descr_sets[node_index], 0, 0, 1, 
+            vk::DescriptorType::eUniformBuffer, nullptr, &descr_sets_buffer.back(), nullptr);
+        
+        descr_sets_buffer.emplace_back(*uniform_buffer, 
+            buffer_offset + offsetof(uniform_buffers_t, col), sizeof(uniform_buffers_t::col));
+        descr_sets_write.emplace_back(*descr_sets[node_index], 1, 0, 1, 
+            vk::DescriptorType::eUniformBuffer, nullptr, &descr_sets_buffer.back(), nullptr);
+    }
     device->updateDescriptorSets(descr_sets_write, nullptr);
 
     // Create DescriptorSets Composite
 
-    std::vector<vk::UniqueDescriptorSet> descr_sets_comp = device->allocateDescriptorSetsUnique({ *descrpool, 1, &descrset_comp_layout.get() });
+    std::vector<vk::UniqueDescriptorSet> descr_sets_comp = 
+        device->allocateDescriptorSetsUnique({ *descrpool, 1, &descrset_comp_layout.get() });
 
-    std::array<vk::DescriptorImageInfo, 1> descr_sets_comp_buffer {
-        vk::DescriptorImageInfo(nullptr, *gbuffer_pos_view, vk::ImageLayout::eShaderReadOnlyOptimal),
-    };
-    std::array<vk::WriteDescriptorSet, 1> descr_sets_comp_write{
-        vk::WriteDescriptorSet(*descr_sets_comp[0], 0, 0, 1, vk::DescriptorType::eInputAttachment, &descr_sets_comp_buffer[0], nullptr, nullptr),
-    };
+    vk::DescriptorImageInfo descr_sets_comp_buffer(nullptr, *gbuffer_pos_view, 
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+    vk::WriteDescriptorSet descr_sets_comp_write(*descr_sets_comp[0], 0, 0, 1, 
+        vk::DescriptorType::eInputAttachment, &descr_sets_comp_buffer, nullptr, nullptr);
     device->updateDescriptorSets(descr_sets_comp_write, nullptr);
 
     // Renderpass
@@ -451,71 +552,6 @@ int main()
     renderpass_info.dependencyCount = (uint32_t)renderpass_deps.size();
     renderpass_info.pDependencies = renderpass_deps.data();
     vk::UniqueRenderPass renderpass = device->createRenderPassUnique(renderpass_info);
-
-    // Load 3D model
-
-    struct vertex_t
-    {
-        glm::vec3 pos;
-        vertex_t() = default;
-        vertex_t(glm::vec2 pos) : pos(glm::vec3(pos, 0)) {}
-    };
-
-    Assimp::Importer importer;
-    const aiScene* scene = importer.ReadFile("D:\\3D\\buildings.fbx", aiProcessPreset_TargetRealtime_Fast);
-
-    std::vector<vertex_t> mesh_vert;
-    std::vector<uint32_t> mesh_idx;
-    auto m = scene->mMeshes[1];
-    for (uint32_t i = 0; i < m->mNumVertices; i++)
-    {
-        vertex_t v;
-        v.pos.x = m->mVertices[i].x;
-        v.pos.y = m->mVertices[i].y;
-        v.pos.z = m->mVertices[i].z;
-        mesh_vert.push_back(v);
-    }
-
-    for (uint32_t i = 0; i < scene->mMeshes[0]->mNumFaces; i++)
-    {
-        for (int v = 0; v < 3; v++)
-        {
-            mesh_idx.push_back(m->mFaces[i].mIndices[v]);
-        }
-    }
-
-    // vertex buffer
-    vk::BufferCreateInfo triangle_buffer_info;
-    triangle_buffer_info.size = mesh_vert.size() * sizeof(vertex_t);
-    triangle_buffer_info.usage = vk::BufferUsageFlagBits::eVertexBuffer;
-    vk::UniqueBuffer triangle_buffer = device->createBufferUnique(triangle_buffer_info);
-    vk::MemoryRequirements triangle_buffer_mem_req = device->getBufferMemoryRequirements(*triangle_buffer);
-    uint32_t triangle_buffer_mem_idx = find_memory(triangle_buffer_mem_req,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-    vk::UniqueDeviceMemory triangle_buffer_mem = device->allocateMemoryUnique({ triangle_buffer_mem_req.size, triangle_buffer_mem_idx });
-    device->bindBufferMemory(*triangle_buffer, *triangle_buffer_mem, 0);
-    if (auto* ptr = reinterpret_cast<vertex_t*>(device->mapMemory(*triangle_buffer_mem, 0, VK_WHOLE_SIZE)))
-    {
-        std::copy(mesh_vert.begin(), mesh_vert.end(), ptr);
-        device->unmapMemory(*triangle_buffer_mem);
-    }
-
-    // index buffer
-    vk::BufferCreateInfo triangle_buffer_idx_info;
-    triangle_buffer_idx_info.size = mesh_idx.size() * sizeof(uint32_t);
-    triangle_buffer_idx_info.usage = vk::BufferUsageFlagBits::eIndexBuffer;
-    vk::UniqueBuffer triangle_buffer_idx = device->createBufferUnique(triangle_buffer_idx_info);
-    vk::MemoryRequirements triangle_buffer_idx_mem_req = device->getBufferMemoryRequirements(*triangle_buffer_idx);
-    uint32_t triangle_buffer_idx_mem_idx = find_memory(triangle_buffer_idx_mem_req,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-    vk::UniqueDeviceMemory triangle_buffer_idx_mem = device->allocateMemoryUnique({ triangle_buffer_idx_mem_req.size, triangle_buffer_idx_mem_idx });
-    device->bindBufferMemory(*triangle_buffer_idx, *triangle_buffer_idx_mem, 0);
-    if (auto* ptr = reinterpret_cast<uint32_t*>(device->mapMemory(*triangle_buffer_idx_mem, 0, VK_WHOLE_SIZE)))
-    {
-        std::copy(mesh_idx.begin(), mesh_idx.end(), ptr);
-        device->unmapMemory(*triangle_buffer_idx_mem);
-    }
-
 
     // Create Pipeline
 
@@ -619,13 +655,13 @@ int main()
     cmd_clear_info.commandPool = *cmdpool;
     cmd_clear_info.level = vk::CommandBufferLevel::ePrimary;
     cmd_clear_info.commandBufferCount = (uint32_t)swapchain_images.size();
-    std::vector<vk::UniqueCommandBuffer> cmd_clear = device->allocateCommandBuffersUnique(cmd_clear_info);
+    std::vector<vk::UniqueCommandBuffer> cmd_draw = device->allocateCommandBuffersUnique(cmd_clear_info);
     std::vector<vk::UniqueFramebuffer> framebuffers(swapchain_images.size());
     std::vector<vk::UniqueImageView> swapchain_views(swapchain_images.size());
     std::vector<vk::CommandBuffer> submit_commands(swapchain_images.size());
     for (int i = 0; i < swapchain_images.size(); i++)
     {
-        cmd_clear[i]->begin({ vk::CommandBufferUsageFlags() });
+        cmd_draw[i]->begin({ vk::CommandBufferUsageFlags() });
         {
             vk::ImageMemoryBarrier barrier;
             barrier.image = swapchain_images[i];
@@ -641,7 +677,7 @@ int main()
             barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
             barrier.oldLayout = vk::ImageLayout::eUndefined;
             barrier.newLayout = vk::ImageLayout::eTransferDstOptimal;
-            cmd_clear[i]->pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics, vk::PipelineStageFlagBits::eTransfer,
+            cmd_draw[i]->pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics, vk::PipelineStageFlagBits::eTransfer,
                 vk::DependencyFlagBits::eByRegion, nullptr, nullptr, barrier);
 
             vk::ImageBlit blit_region;
@@ -651,14 +687,14 @@ int main()
             blit_region.dstSubresource = vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1);
             blit_region.dstOffsets[0] = vk::Offset3D(0, 0, 0);
             blit_region.dstOffsets[1] = vk::Offset3D(surface_caps.currentExtent.width, surface_caps.currentExtent.height, 1);
-            cmd_clear[i]->blitImage(*image, vk::ImageLayout::eTransferSrcOptimal,
+            cmd_draw[i]->blitImage(*image, vk::ImageLayout::eTransferSrcOptimal,
                 swapchain_images[i], vk::ImageLayout::eTransferDstOptimal, blit_region, vk::Filter::eLinear);
 
             barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
             barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
             barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
             barrier.newLayout = vk::ImageLayout::eColorAttachmentOptimal;
-            cmd_clear[i]->pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eColorAttachmentOutput,
+            cmd_draw[i]->pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eColorAttachmentOutput,
                 vk::DependencyFlagBits::eByRegion, nullptr, nullptr, barrier);
 
             vk::ImageViewCreateInfo view_info;
@@ -692,28 +728,37 @@ int main()
             renderpass_begin_info.renderArea.offset = {};
             renderpass_begin_info.clearValueCount = (uint32_t)clear_values.size();
             renderpass_begin_info.pClearValues = clear_values.data();
-            cmd_clear[i]->beginRenderPass(renderpass_begin_info, vk::SubpassContents::eInline);
+            cmd_draw[i]->beginRenderPass(renderpass_begin_info, vk::SubpassContents::eInline);
             {
-                cmd_clear[i]->bindVertexBuffers(0, *triangle_buffer, { 0 });
-                cmd_clear[i]->bindIndexBuffer(*triangle_buffer_idx, 0, vk::IndexType::eUint32);
-                cmd_clear[i]->bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, descr_sets[0].get(), nullptr);
-                cmd_clear[i]->bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-                cmd_clear[i]->drawIndexed((uint32_t)mesh_idx.size(), 1, 0, 0, 0);
+                cmd_draw[i]->bindVertexBuffers(0, *triangle_buffer, { 0 });
+                cmd_draw[i]->bindIndexBuffer(*triangle_buffer_idx, 0, vk::IndexType::eUint32);
+                cmd_draw[i]->bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+                for (uint32_t node_index = 0; node_index < nodes.size(); node_index++)
+                {
+                    cmd_draw[i]->bindDescriptorSets(vk::PipelineBindPoint::eGraphics, 
+                        *pipeline_layout, 0, descr_sets[node_index].get(), nullptr);
+                    for (uint32_t mesh_index : nodes[node_index].mesh_indices)
+                    {
+                        cmd_draw[i]->drawIndexed(meshes[mesh_index].idx_count, 1, 
+                            meshes[mesh_index].idx_offset, meshes[mesh_index].vtx_offset, 0);
+                    }
+                }
             }
-            cmd_clear[i]->nextSubpass(vk::SubpassContents::eInline);
+            cmd_draw[i]->nextSubpass(vk::SubpassContents::eInline);
             {
-                cmd_clear[i]->bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_comp_layout, 0, descr_sets_comp[0].get(), nullptr);
-                cmd_clear[i]->bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline_comp);
-                cmd_clear[i]->draw(6, 1, 0, 0);
+                cmd_draw[i]->bindDescriptorSets(vk::PipelineBindPoint::eGraphics, 
+                    *pipeline_comp_layout, 0, descr_sets_comp[0].get(), nullptr);
+                cmd_draw[i]->bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline_comp);
+                cmd_draw[i]->draw(6, 1, 0, 0);
             }
-            cmd_clear[i]->endRenderPass();
+            cmd_draw[i]->endRenderPass();
 
             //vk::ClearColorValue clear_color = std::array<float, 4>({ 1, 0, 1, 1 });
             //cmd_clear[i]->clearColorImage(swapchain_images[i], vk::ImageLayout::eTransferDstOptimal, 
             //    clear_color, barrier.subresourceRange);
         }
-        cmd_clear[i]->end();
-        submit_commands[i] = *cmd_clear[i];
+        cmd_draw[i]->end();
+        submit_commands[i] = *cmd_draw[i];
     }
 
     vk::UniqueFence submit_fence = device->createFenceUnique({});
@@ -741,11 +786,16 @@ int main()
             if (uniform_buffers_t* uniforms_ptr = reinterpret_cast<uniform_buffers_t*>(device->mapMemory(*uniform_mem, 0, VK_WHOLE_SIZE)))
             {
                 float aspect = (float)surface_caps.currentExtent.width / (float)surface_caps.currentExtent.height;
-                uniforms_ptr->mvp = glm::perspective(glm::radians(85.f), aspect, .1f, 100.f) *
-                    glm::lookAt(glm::vec3(0, -2, 5), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0)) * 
-                    glm::scale(glm::vec3(.05f)) *
-                    glm::eulerAngleY(angle);
-                uniforms_ptr->col.r = glm::sin(angle);
+                for (const auto& n : nodes)
+                {
+                    uniforms_ptr->mvp = glm::perspective(glm::radians(85.f), aspect, .1f, 100.f) *
+                        glm::lookAt(glm::vec3(0, -2, 5), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0)) *
+                        glm::scale(glm::vec3(.05f)) *
+                        glm::eulerAngleY(angle) * 
+                        n.mat;
+                    uniforms_ptr->col = glm::vec4(n.col, 1.f);
+                    uniforms_ptr++;
+                }
                 device->unmapMemory(*uniform_mem);
             }
 
