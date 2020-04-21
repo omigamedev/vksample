@@ -292,7 +292,9 @@ int main()
         node_t& node = nodes.emplace_back();
         node.col = glm::linearRand(glm::vec3(0), glm::vec3(1));
         node.mat = glm::identity<glm::mat4>();
-        //std::copy_n(scene_node->mTransformation[0], 16, glm::value_ptr(node.mat));
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                node.mat[i][j] = scene_node->mTransformation[j][i];
         node.mesh_indices.insert(node.mesh_indices.end(), 
             scene_node->mMeshes, 
             scene_node->mMeshes + scene_node->mNumMeshes);
@@ -438,6 +440,35 @@ int main()
     gbuffer_pos_view_info.subresourceRange.levelCount = 1;
     vk::UniqueImageView gbuffer_pos_view = device->createImageViewUnique(gbuffer_pos_view_info);
 
+
+    // Create depth image
+
+    vk::ImageCreateInfo depth_info;
+    depth_info.imageType = vk::ImageType::e2D;
+    depth_info.format = vk::Format::eD16Unorm;
+    depth_info.extent = vk::Extent3D(surface_caps.currentExtent, 1);
+    depth_info.mipLevels = 1;
+    depth_info.arrayLayers = 1;
+    depth_info.samples = vk::SampleCountFlagBits::e1;
+    depth_info.tiling = vk::ImageTiling::eOptimal; // check support
+    depth_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    depth_info.initialLayout = vk::ImageLayout::eUndefined;
+    vk::UniqueImage depth = device->createImageUnique(depth_info);
+    vk::MemoryRequirements depth_mem_req = device->getImageMemoryRequirements(*depth);
+    uint32_t depth_mem_idx = find_memory(depth_mem_req, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    vk::UniqueDeviceMemory depth_mem = device->allocateMemoryUnique({ depth_mem_req.size, depth_mem_idx });
+    device->bindImageMemory(*depth, *depth_mem, 0);
+        vk::ImageViewCreateInfo depth_view_info;
+    depth_view_info.image = *depth;
+    depth_view_info.viewType = vk::ImageViewType::e2D;
+    depth_view_info.format = depth_info.format;
+    depth_view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eDepth;
+    depth_view_info.subresourceRange.baseArrayLayer = 0;
+    depth_view_info.subresourceRange.baseMipLevel = 0;
+    depth_view_info.subresourceRange.layerCount = 1;
+    depth_view_info.subresourceRange.levelCount = 1;
+    vk::UniqueImageView depth_view = device->createImageViewUnique(depth_view_info);
+
     // Create DescriptorSets
 
     struct uniform_buffers_t
@@ -494,7 +525,7 @@ int main()
 
     // Renderpass
 
-    std::array<vk::AttachmentDescription, 2> renderpass_attachments;
+    std::array<vk::AttachmentDescription, 3> renderpass_attachments;
     // color buffer
     renderpass_attachments[0].format = swapchain_info.imageFormat;
     renderpass_attachments[0].samples = vk::SampleCountFlagBits::e1;
@@ -513,15 +544,28 @@ int main()
     renderpass_attachments[1].stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
     renderpass_attachments[1].initialLayout = vk::ImageLayout::eUndefined;
     renderpass_attachments[1].finalLayout = vk::ImageLayout::eColorAttachmentOptimal;
-    
+    // depth
+    renderpass_attachments[2].format = depth_info.format;
+    renderpass_attachments[2].samples = vk::SampleCountFlagBits::e1;
+    renderpass_attachments[2].loadOp = vk::AttachmentLoadOp::eClear;
+    renderpass_attachments[2].storeOp = vk::AttachmentStoreOp::eDontCare;
+    renderpass_attachments[2].stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
+    renderpass_attachments[2].stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
+    renderpass_attachments[2].initialLayout = vk::ImageLayout::eUndefined;
+    renderpass_attachments[2].finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+
     std::array<vk::SubpassDescription, 2> renderpass_subpasses;
     
     std::array<vk::AttachmentReference, 1> renderpass_references_first;
     renderpass_references_first[0].attachment = 1;
     renderpass_references_first[0].layout = vk::ImageLayout::eColorAttachmentOptimal;
+    vk::AttachmentReference renderpass_references_first_depth;
+    renderpass_references_first_depth.attachment = 2;
+    renderpass_references_first_depth.layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
     renderpass_subpasses[0].pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
     renderpass_subpasses[0].colorAttachmentCount = (uint32_t)renderpass_references_first.size();
     renderpass_subpasses[0].pColorAttachments = renderpass_references_first.data();
+    renderpass_subpasses[0].pDepthStencilAttachment = &renderpass_references_first_depth;
 
     std::array<vk::AttachmentReference, 1> renderpass_references_second;
     renderpass_references_second[0].attachment = 0;
@@ -590,7 +634,7 @@ int main()
     pipeline_raster.depthClampEnable = false;
     pipeline_raster.rasterizerDiscardEnable = false;
     pipeline_raster.polygonMode = vk::PolygonMode::eFill;
-    pipeline_raster.cullMode = vk::CullModeFlagBits::eNone;
+    pipeline_raster.cullMode = vk::CullModeFlagBits::eBack;
     pipeline_raster.frontFace = vk::FrontFace::eClockwise;
     pipeline_raster.depthBiasEnable = false;
     pipeline_raster.lineWidth = 1.f;
@@ -598,6 +642,13 @@ int main()
     vk::PipelineMultisampleStateCreateInfo pipeline_multisample;
     pipeline_multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
     pipeline_multisample.sampleShadingEnable = false;
+
+    vk::PipelineDepthStencilStateCreateInfo pipeline_depth;
+    pipeline_depth.depthTestEnable = true;
+    pipeline_depth.depthWriteEnable = true;
+    pipeline_depth.depthCompareOp = vk::CompareOp::eLess;
+    pipeline_depth.depthBoundsTestEnable = false;
+    pipeline_depth.stencilTestEnable = false;
 
     vk::PipelineColorBlendAttachmentState pipeline_blend_color;
     pipeline_blend_color.blendEnable = false;
@@ -620,7 +671,7 @@ int main()
     pipeline_info.pViewportState = &pipeline_viewport;
     pipeline_info.pRasterizationState = &pipeline_raster;
     pipeline_info.pMultisampleState = &pipeline_multisample;
-    pipeline_info.pDepthStencilState = nullptr;
+    pipeline_info.pDepthStencilState = &pipeline_depth;
     pipeline_info.pColorBlendState = &pipeline_blend;
     pipeline_info.pDynamicState = &pipeline_dynamic;
     pipeline_info.layout = *pipeline_layout;
@@ -643,6 +694,7 @@ int main()
     pipeline_info.stageCount = (uint32_t)pipeline_stages_composite.size();
     pipeline_info.pStages = pipeline_stages_composite.data();
     pipeline_info.pVertexInputState = &pipeline_input_comp;
+    pipeline_info.pDepthStencilState = nullptr;
     pipeline_info.layout = *pipeline_comp_layout;
     pipeline_info.subpass = 1;
 
@@ -707,7 +759,7 @@ int main()
             view_info.subresourceRange.layerCount = 1;
             view_info.subresourceRange.levelCount = 1;
             swapchain_views[i] = device->createImageViewUnique(view_info);
-            std::array<vk::ImageView, 2> framebuffer_attachments{ *swapchain_views[i], *gbuffer_pos_view };
+            std::array<vk::ImageView, 3> framebuffer_attachments{ *swapchain_views[i], *gbuffer_pos_view, *depth_view };
             vk::FramebufferCreateInfo framebuffer_info;
             framebuffer_info.renderPass = *renderpass;
             framebuffer_info.attachmentCount = (uint32_t)framebuffer_attachments.size();
@@ -717,9 +769,10 @@ int main()
             framebuffer_info.layers = 1;
             framebuffers[i] = device->createFramebufferUnique(framebuffer_info);
 
-            std::array<vk::ClearValue, 2> clear_values {
+            std::array<vk::ClearValue, 3> clear_values{
                 vk::ClearValue(),
                 vk::ClearColorValue({ std::array<float,4>{1, 0, 1, 1} }),
+                vk::ClearDepthStencilValue(1.f, 0),
             };
             vk::RenderPassBeginInfo renderpass_begin_info;
             renderpass_begin_info.renderPass = *renderpass;
@@ -769,10 +822,13 @@ int main()
     q.waitIdle();
 
     MSG msg;
-    while (GetMessage(&msg, hWnd, 0, 0) > 0)
+    while (running)
     {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        if (PeekMessage(&msg, hWnd, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
 
         if (!running)
             break;
@@ -782,7 +838,7 @@ int main()
         if (backbuffer.result == vk::Result::eSuccess)
         {
             static float angle = 0.f;
-            angle += glm::radians(5.f);
+            angle += glm::radians(1.f);
             if (uniform_buffers_t* uniforms_ptr = reinterpret_cast<uniform_buffers_t*>(device->mapMemory(*uniform_mem, 0, VK_WHOLE_SIZE)))
             {
                 float aspect = (float)surface_caps.currentExtent.width / (float)surface_caps.currentExtent.height;
