@@ -13,6 +13,18 @@ static uint32_t device_family = 0;
 static vk::PhysicalDevice physical_device;
 static vk::Queue q;
 
+struct uniform_buffers_t
+{
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
+    static constexpr uint32_t mvp_size = sizeof(model) + sizeof(view) + sizeof(proj);
+    uint8_t pad2[0x100 - mvp_size & ~0x100]; // alignment
+    
+    glm::vec4 col;
+    uint8_t pad3[0x100 - sizeof(col) & ~0x100]; // alignment
+};
+
 LRESULT WINAPI main_window_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
@@ -77,6 +89,36 @@ uint32_t find_memory(const vk::MemoryRequirements& req, vk::MemoryPropertyFlags 
         if ((1 << mem_i) & req.memoryTypeBits && (mp.memoryTypes[mem_i].propertyFlags & flags) == flags)
             return mem_i;
     throw std::runtime_error("find_memory failed");
+}
+
+auto create_gbuffer(const vk::Extent2D& extent, vk::Format format)
+{
+    vk::ImageCreateInfo info;
+    info.imageType = vk::ImageType::e2D;
+    info.format = format;
+    info.extent = vk::Extent3D(extent, 1);
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = vk::SampleCountFlagBits::e1;
+    info.tiling = vk::ImageTiling::eOptimal;
+    info.usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eInputAttachment;
+    info.initialLayout = vk::ImageLayout::eUndefined;
+    vk::UniqueImage image = device->createImageUnique(info);
+    vk::MemoryRequirements mem_req = device->getImageMemoryRequirements(*image);
+    uint32_t mem_idx = find_memory(mem_req, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    vk::UniqueDeviceMemory mem = device->allocateMemoryUnique({ mem_req.size, mem_idx });
+    device->bindImageMemory(*image, *mem, 0);
+    vk::ImageViewCreateInfo view_info;
+    view_info.image = *image;
+    view_info.viewType = vk::ImageViewType::e2D;
+    view_info.format = info.format;
+    view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    view_info.subresourceRange.baseArrayLayer = 0;
+    view_info.subresourceRange.baseMipLevel = 0;
+    view_info.subresourceRange.layerCount = 1;
+    view_info.subresourceRange.levelCount = 1;
+    vk::UniqueImageView view = device->createImageViewUnique(view_info);
+    return std::tuple(std::move(image), std::move(mem), std::move(view));
 }
 
 void change_layout(const vk::UniqueImage& image, vk::ImageLayout src, vk::ImageLayout dst)
@@ -249,8 +291,9 @@ int main()
         glm::vec3 pos;
         glm::vec3 nor;
         vertex_t() = default;
-        vertex_t(glm::vec3 pos) : pos(pos) {}
-        vertex_t(glm::vec2 pos) : pos(glm::vec3(pos, 0)) {}
+        vertex_t(glm::vec3 pos) : pos(pos), nor(0) {}
+        vertex_t(glm::vec2 pos) : pos(glm::vec3(pos, 0)), nor(0) {}
+        vertex_t(glm::vec3 pos, glm::vec3 nor) : pos(pos), nor(nor) {}
     };
 
     struct mesh_t
@@ -283,7 +326,8 @@ int main()
         for (uint32_t vertex_index = 0; vertex_index < scene_mesh->mNumVertices; vertex_index++)
         {
             glm::vec3 pos = glm::make_vec3(&scene_mesh->mVertices[vertex_index].x);
-            mesh_data_vert.emplace_back(pos);
+            glm::vec3 nor = glm::make_vec3(&scene_mesh->mNormals[vertex_index].x);
+            mesh_data_vert.emplace_back(pos, nor);
         }
         for (uint32_t face_index = 0; face_index < scene_mesh->mNumFaces; face_index++)
         {
@@ -345,7 +389,7 @@ int main()
     cmdpool = device->createCommandPoolUnique({ {}, device_family });
     std::array<vk::DescriptorPoolSize, 2> descrpool_sizes {
         vk::DescriptorPoolSize{ vk::DescriptorType::eUniformBuffer, (uint32_t)nodes.size() * 2 },
-        vk::DescriptorPoolSize{ vk::DescriptorType::eInputAttachment, 2 },
+        vk::DescriptorPoolSize{ vk::DescriptorType::eInputAttachment, 4 },
     };
     descrpool = device->createDescriptorPoolUnique({ {}, (uint32_t)nodes.size() + 1, 
         (uint32_t)descrpool_sizes.size(), descrpool_sizes.data() });
@@ -406,9 +450,11 @@ int main()
 
     // Create PipelineLayout Composite
 
-    std::array<vk::DescriptorSetLayoutBinding, 2> descrset_comp_layout_bindings {
+    std::array<vk::DescriptorSetLayoutBinding, 4> descrset_comp_layout_bindings {
         vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
         vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
+        vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
+        vk::DescriptorSetLayoutBinding(3, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
     };
     vk::DescriptorSetLayoutCreateInfo descrset_comp_layout_info;
     descrset_comp_layout_info.bindingCount = (uint32_t)descrset_comp_layout_bindings.size();
@@ -420,34 +466,14 @@ int main()
     pipeline_comp_layout_info.pushConstantRangeCount = 0;
     vk::UniquePipelineLayout pipeline_comp_layout = device->createPipelineLayoutUnique(pipeline_comp_layout_info);
 
-    // Create gbuffer
+    // Create gbuffers
 
-    vk::ImageCreateInfo gbuffer_pos_info;
-    gbuffer_pos_info.imageType = vk::ImageType::e2D;
-    gbuffer_pos_info.format = vk::Format::eR32G32B32A32Sfloat;
-    gbuffer_pos_info.extent = vk::Extent3D(surface_caps.currentExtent, 1);
-    gbuffer_pos_info.mipLevels = 1;
-    gbuffer_pos_info.arrayLayers = 1;
-    gbuffer_pos_info.samples = vk::SampleCountFlagBits::e1;
-    gbuffer_pos_info.tiling = vk::ImageTiling::eOptimal;
-    gbuffer_pos_info.usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eInputAttachment;
-    gbuffer_pos_info.initialLayout = vk::ImageLayout::eUndefined;
-    vk::UniqueImage gbuffer_pos = device->createImageUnique(gbuffer_pos_info);
-    vk::MemoryRequirements gbuffer_pos_mem_req = device->getImageMemoryRequirements(*gbuffer_pos);
-    uint32_t gbuffer_pos_mem_idx = find_memory(gbuffer_pos_mem_req, vk::MemoryPropertyFlagBits::eDeviceLocal);
-    vk::UniqueDeviceMemory gbuffer_pos_mem = device->allocateMemoryUnique({ gbuffer_pos_mem_req.size, gbuffer_pos_mem_idx });
-    device->bindImageMemory(*gbuffer_pos, *gbuffer_pos_mem, 0);
-    vk::ImageViewCreateInfo gbuffer_pos_view_info;
-    gbuffer_pos_view_info.image = *gbuffer_pos;
-    gbuffer_pos_view_info.viewType = vk::ImageViewType::e2D;
-    gbuffer_pos_view_info.format = gbuffer_pos_info.format;
-    gbuffer_pos_view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
-    gbuffer_pos_view_info.subresourceRange.baseArrayLayer = 0;
-    gbuffer_pos_view_info.subresourceRange.baseMipLevel = 0;
-    gbuffer_pos_view_info.subresourceRange.layerCount = 1;
-    gbuffer_pos_view_info.subresourceRange.levelCount = 1;
-    vk::UniqueImageView gbuffer_pos_view = device->createImageViewUnique(gbuffer_pos_view_info);
-
+    auto [gbuffer_pos, gbuffer_pos_mem, gbuffer_pos_view] =
+        create_gbuffer(surface_caps.currentExtent, vk::Format::eR32G32B32A32Sfloat);
+    auto [gbuffer_nor, gbuffer_nor_mem, gbuffer_nor_view] =
+        create_gbuffer(surface_caps.currentExtent, vk::Format::eR32G32B32A32Sfloat);
+    auto [gbuffer_alb, gbuffer_alb_mem, gbuffer_alb_view] =
+        create_gbuffer(surface_caps.currentExtent, vk::Format::eR8G8B8A8Unorm);
 
     // Create depth image
 
@@ -479,14 +505,6 @@ int main()
 
     // Create DescriptorSets
 
-    struct uniform_buffers_t
-    {
-        glm::mat4 mvp;
-        uint8_t pad0[0x100 - sizeof(mvp)]; // alignment
-        glm::vec4 col;
-        uint8_t pad1[0x100 - sizeof(col)]; // alignment
-    };
-
     vk::BufferCreateInfo uniform_buffer_info;
     uniform_buffer_info.size = sizeof(uniform_buffers_t) * nodes.size();
     uniform_buffer_info.usage = vk::BufferUsageFlagBits::eUniformBuffer;
@@ -503,16 +521,17 @@ int main()
     
     std::vector<vk::DescriptorBufferInfo> descr_sets_buffer;
     std::vector<vk::WriteDescriptorSet> descr_sets_write;
-    descr_sets_buffer.reserve(nodes.size() * 2);
+    descr_sets_buffer.reserve(nodes.size() * 4);
     descr_sets_write.reserve(nodes.size() * 2);
     for (uint32_t node_index = 0; node_index < nodes.size(); node_index++)
     {
+        // model, view, proj
         vk::DeviceSize buffer_offset = node_index * sizeof(uniform_buffers_t);
         descr_sets_buffer.emplace_back(*uniform_buffer, 
-            buffer_offset + offsetof(uniform_buffers_t, mvp), sizeof(uniform_buffers_t::mvp));
-        descr_sets_write.emplace_back(*descr_sets[node_index], 0, 0, 1, 
+            buffer_offset + offsetof(uniform_buffers_t, model), uniform_buffers_t::mvp_size);
+        descr_sets_write.emplace_back(*descr_sets[node_index], 0, 0, 1,
             vk::DescriptorType::eUniformBuffer, nullptr, &descr_sets_buffer.back(), nullptr);
-        
+        // col
         descr_sets_buffer.emplace_back(*uniform_buffer, 
             buffer_offset + offsetof(uniform_buffers_t, col), sizeof(uniform_buffers_t::col));
         descr_sets_write.emplace_back(*descr_sets[node_index], 1, 0, 1, 
@@ -525,19 +544,25 @@ int main()
     std::vector<vk::UniqueDescriptorSet> descr_sets_comp = 
         device->allocateDescriptorSetsUnique({ *descrpool, 1, &descrset_comp_layout.get() });
 
-    vk::DescriptorImageInfo descr_sets_comp_gbuf(nullptr, *gbuffer_pos_view, vk::ImageLayout::eShaderReadOnlyOptimal);
     vk::DescriptorImageInfo descr_sets_comp_depth(nullptr, *depth_view, vk::ImageLayout::eShaderReadOnlyOptimal);
-    std::array<vk::WriteDescriptorSet, 2> descr_sets_comp_write{
+    vk::DescriptorImageInfo descr_sets_comp_pos(nullptr, *gbuffer_pos_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+    vk::DescriptorImageInfo descr_sets_comp_nor(nullptr, *gbuffer_nor_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+    vk::DescriptorImageInfo descr_sets_comp_alb(nullptr, *gbuffer_alb_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+    std::array<vk::WriteDescriptorSet, 4> descr_sets_comp_write{
         vk::WriteDescriptorSet(*descr_sets_comp[0], 0, 0, 1,
-            vk::DescriptorType::eInputAttachment, &descr_sets_comp_gbuf, nullptr, nullptr),
-        vk::WriteDescriptorSet(*descr_sets_comp[0], 1, 0, 1,
             vk::DescriptorType::eInputAttachment, &descr_sets_comp_depth, nullptr, nullptr),
+        vk::WriteDescriptorSet(*descr_sets_comp[0], 1, 0, 1,
+            vk::DescriptorType::eInputAttachment, &descr_sets_comp_pos, nullptr, nullptr),
+        vk::WriteDescriptorSet(*descr_sets_comp[0], 2, 0, 1,
+            vk::DescriptorType::eInputAttachment, &descr_sets_comp_nor, nullptr, nullptr),
+        vk::WriteDescriptorSet(*descr_sets_comp[0], 3, 0, 1,
+            vk::DescriptorType::eInputAttachment, &descr_sets_comp_alb, nullptr, nullptr),
     };
     device->updateDescriptorSets(descr_sets_comp_write, nullptr);
 
     // Renderpass
 
-    std::array<vk::AttachmentDescription, 3> renderpass_attachments;
+    std::array<vk::AttachmentDescription, 5> renderpass_attachments;
     // color buffer
     renderpass_attachments[0].format = swapchain_info.imageFormat;
     renderpass_attachments[0].samples = vk::SampleCountFlagBits::e1;
@@ -547,32 +572,54 @@ int main()
     renderpass_attachments[0].stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
     renderpass_attachments[0].initialLayout = vk::ImageLayout::eColorAttachmentOptimal;
     renderpass_attachments[0].finalLayout = vk::ImageLayout::ePresentSrcKHR;
-    // gbuffer pos
-    renderpass_attachments[1].format = gbuffer_pos_info.format;
+    // depth
+    renderpass_attachments[1].format = depth_info.format;
     renderpass_attachments[1].samples = vk::SampleCountFlagBits::e1;
     renderpass_attachments[1].loadOp = vk::AttachmentLoadOp::eClear;
     renderpass_attachments[1].storeOp = vk::AttachmentStoreOp::eDontCare;
     renderpass_attachments[1].stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
     renderpass_attachments[1].stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
     renderpass_attachments[1].initialLayout = vk::ImageLayout::eUndefined;
-    renderpass_attachments[1].finalLayout = vk::ImageLayout::eColorAttachmentOptimal;
-    // depth
-    renderpass_attachments[2].format = depth_info.format;
+    renderpass_attachments[1].finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+    // gbuffer pos
+    renderpass_attachments[2].format = vk::Format::eR32G32B32A32Sfloat;
     renderpass_attachments[2].samples = vk::SampleCountFlagBits::e1;
     renderpass_attachments[2].loadOp = vk::AttachmentLoadOp::eClear;
     renderpass_attachments[2].storeOp = vk::AttachmentStoreOp::eDontCare;
     renderpass_attachments[2].stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
     renderpass_attachments[2].stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
     renderpass_attachments[2].initialLayout = vk::ImageLayout::eUndefined;
-    renderpass_attachments[2].finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+    renderpass_attachments[2].finalLayout = vk::ImageLayout::eColorAttachmentOptimal;
+    // gbuffer nor
+    renderpass_attachments[3].format = vk::Format::eR32G32B32A32Sfloat;
+    renderpass_attachments[3].samples = vk::SampleCountFlagBits::e1;
+    renderpass_attachments[3].loadOp = vk::AttachmentLoadOp::eClear;
+    renderpass_attachments[3].storeOp = vk::AttachmentStoreOp::eDontCare;
+    renderpass_attachments[3].stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
+    renderpass_attachments[3].stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
+    renderpass_attachments[3].initialLayout = vk::ImageLayout::eUndefined;
+    renderpass_attachments[3].finalLayout = vk::ImageLayout::eColorAttachmentOptimal;
+    // gbuffer alb
+    renderpass_attachments[4].format = vk::Format::eR8G8B8A8Unorm;
+    renderpass_attachments[4].samples = vk::SampleCountFlagBits::e1;
+    renderpass_attachments[4].loadOp = vk::AttachmentLoadOp::eClear;
+    renderpass_attachments[4].storeOp = vk::AttachmentStoreOp::eDontCare;
+    renderpass_attachments[4].stencilLoadOp = vk::AttachmentLoadOp::eDontCare;
+    renderpass_attachments[4].stencilStoreOp = vk::AttachmentStoreOp::eDontCare;
+    renderpass_attachments[4].initialLayout = vk::ImageLayout::eUndefined;
+    renderpass_attachments[4].finalLayout = vk::ImageLayout::eColorAttachmentOptimal;
 
     std::array<vk::SubpassDescription, 2> renderpass_subpasses;
     
-    std::array<vk::AttachmentReference, 1> renderpass_references_first;
-    renderpass_references_first[0].attachment = 1;
+    std::array<vk::AttachmentReference, 3> renderpass_references_first;
+    renderpass_references_first[0].attachment = 2; // pos
     renderpass_references_first[0].layout = vk::ImageLayout::eColorAttachmentOptimal;
+    renderpass_references_first[1].attachment = 3; // nor
+    renderpass_references_first[1].layout = vk::ImageLayout::eColorAttachmentOptimal;
+    renderpass_references_first[2].attachment = 4; // alb
+    renderpass_references_first[2].layout = vk::ImageLayout::eColorAttachmentOptimal;
     vk::AttachmentReference renderpass_references_first_depth;
-    renderpass_references_first_depth.attachment = 2;
+    renderpass_references_first_depth.attachment = 1; // depth
     renderpass_references_first_depth.layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
     renderpass_subpasses[0].pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
     renderpass_subpasses[0].colorAttachmentCount = (uint32_t)renderpass_references_first.size();
@@ -582,11 +629,15 @@ int main()
     std::array<vk::AttachmentReference, 1> renderpass_references_second;
     renderpass_references_second[0].attachment = 0;
     renderpass_references_second[0].layout = vk::ImageLayout::eColorAttachmentOptimal;
-    std::array<vk::AttachmentReference, 2> renderpass_references_second_input;
-    renderpass_references_second_input[0].attachment = 1;
+    std::array<vk::AttachmentReference, 4> renderpass_references_second_input;
+    renderpass_references_second_input[0].attachment = 1; // depth
     renderpass_references_second_input[0].layout = vk::ImageLayout::eShaderReadOnlyOptimal;
-    renderpass_references_second_input[1].attachment = 2;
+    renderpass_references_second_input[1].attachment = 2; // pos
     renderpass_references_second_input[1].layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    renderpass_references_second_input[2].attachment = 3; // nor
+    renderpass_references_second_input[2].layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    renderpass_references_second_input[3].attachment = 4; // alb
+    renderpass_references_second_input[3].layout = vk::ImageLayout::eShaderReadOnlyOptimal;
     renderpass_subpasses[1].pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
     renderpass_subpasses[1].colorAttachmentCount = (uint32_t)renderpass_references_second.size();
     renderpass_subpasses[1].pColorAttachments = renderpass_references_second.data();
@@ -632,8 +683,9 @@ int main()
     std::array<vk::VertexInputBindingDescription, 1> pipeline_input_bindings{
         vk::VertexInputBindingDescription(0, sizeof(vertex_t), vk::VertexInputRate::eVertex),
     };
-    std::array<vk::VertexInputAttributeDescription, 1> pipeline_input_attributes{
+    std::array<vk::VertexInputAttributeDescription, 2> pipeline_input_attributes{
         vk::VertexInputAttributeDescription(0, 0, vk::Format::eR32G32B32Sfloat, offsetof(vertex_t, pos)),
+        vk::VertexInputAttributeDescription(1, 0, vk::Format::eR32G32B32Sfloat, offsetof(vertex_t, nor)),
     };
     vk::PipelineVertexInputStateCreateInfo pipeline_input;
     pipeline_input.vertexBindingDescriptionCount = (uint32_t)pipeline_input_bindings.size();
@@ -673,14 +725,19 @@ int main()
     pipeline_depth.depthBoundsTestEnable = false;
     pipeline_depth.stencilTestEnable = false;
 
-    vk::PipelineColorBlendAttachmentState pipeline_blend_color;
-    pipeline_blend_color.blendEnable = false;
-    pipeline_blend_color.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+    vk::ColorComponentFlags gbuffer_mask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
         vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    std::array<vk::PipelineColorBlendAttachmentState, 3> pipeline_blend_attachments;
+    pipeline_blend_attachments[0].blendEnable = false;
+    pipeline_blend_attachments[0].colorWriteMask = gbuffer_mask;
+    pipeline_blend_attachments[1].blendEnable = false;
+    pipeline_blend_attachments[1].colorWriteMask = gbuffer_mask;
+    pipeline_blend_attachments[2].blendEnable = false;
+    pipeline_blend_attachments[2].colorWriteMask = gbuffer_mask;
     vk::PipelineColorBlendStateCreateInfo pipeline_blend;
     pipeline_blend.logicOpEnable = false;
-    pipeline_blend.attachmentCount = 1;
-    pipeline_blend.pAttachments = &pipeline_blend_color;
+    pipeline_blend.attachmentCount = (uint32_t)pipeline_blend_attachments.size();
+    pipeline_blend.pAttachments = pipeline_blend_attachments.data();
 
     vk::PipelineDynamicStateCreateInfo pipeline_dynamic;
     pipeline_dynamic.dynamicStateCount = 0;
@@ -714,10 +771,20 @@ int main()
 
     vk::PipelineVertexInputStateCreateInfo pipeline_input_comp;
 
+    vk::PipelineColorBlendAttachmentState pipeline_blend_color;
+    pipeline_blend_color.blendEnable = false;
+    pipeline_blend_color.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    vk::PipelineColorBlendStateCreateInfo pipeline_blend_comp;
+    pipeline_blend_comp.logicOpEnable = false;
+    pipeline_blend_comp.attachmentCount = 1;
+    pipeline_blend_comp.pAttachments = &pipeline_blend_color;
+
     pipeline_info.stageCount = (uint32_t)pipeline_stages_composite.size();
     pipeline_info.pStages = pipeline_stages_composite.data();
     pipeline_info.pVertexInputState = &pipeline_input_comp;
     pipeline_info.pDepthStencilState = nullptr;
+    pipeline_info.pColorBlendState = &pipeline_blend_comp;
     pipeline_info.layout = *pipeline_comp_layout;
     pipeline_info.subpass = 1;
 
@@ -782,7 +849,13 @@ int main()
             view_info.subresourceRange.layerCount = 1;
             view_info.subresourceRange.levelCount = 1;
             swapchain_views[i] = device->createImageViewUnique(view_info);
-            std::array<vk::ImageView, 3> framebuffer_attachments{ *swapchain_views[i], *gbuffer_pos_view, *depth_view };
+            std::array<vk::ImageView, 5> framebuffer_attachments{ 
+                *swapchain_views[i], 
+                *depth_view, 
+                *gbuffer_pos_view,
+                *gbuffer_nor_view,
+                *gbuffer_alb_view,
+            };
             vk::FramebufferCreateInfo framebuffer_info;
             framebuffer_info.renderPass = *renderpass;
             framebuffer_info.attachmentCount = (uint32_t)framebuffer_attachments.size();
@@ -792,10 +865,12 @@ int main()
             framebuffer_info.layers = 1;
             framebuffers[i] = device->createFramebufferUnique(framebuffer_info);
 
-            std::array<vk::ClearValue, 3> clear_values{
-                vk::ClearValue(),
-                vk::ClearColorValue({ std::array<float,4>{1, 0, 1, 0} }),
-                vk::ClearDepthStencilValue(1.f, 0),
+            std::array<vk::ClearValue, 5> clear_values{
+                vk::ClearValue(),                                         // color (not cleared)
+                vk::ClearDepthStencilValue(1.f, 0),                       // depth
+                vk::ClearColorValue({ std::array<float,4>{0, 0, 0, 1} }), // pos
+                vk::ClearColorValue({ std::array<float,4>{0, 0, 0, 1} }), // nor
+                vk::ClearColorValue({ std::array<float,4>{0, 0, 0, 1} }), // alb
             };
             vk::RenderPassBeginInfo renderpass_begin_info;
             renderpass_begin_info.renderPass = *renderpass;
@@ -867,11 +942,9 @@ int main()
                 float aspect = (float)surface_caps.currentExtent.width / (float)surface_caps.currentExtent.height;
                 for (const auto& n : nodes)
                 {
-                    uniforms_ptr->mvp = glm::perspective(glm::radians(85.f), aspect, .1f, 100.f) *
-                        glm::lookAt(glm::vec3(0, -2, 5), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0)) *
-                        glm::scale(glm::vec3(.05f)) *
-                        glm::eulerAngleY(angle) * 
-                        n.mat;
+                    uniforms_ptr->proj = glm::perspective(glm::radians(85.f), aspect, .1f, 100.f);
+                    uniforms_ptr->view = glm::lookAt(glm::vec3(0, -2, 5), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
+                    uniforms_ptr->model = glm::scale(glm::vec3(.05f)) * glm::eulerAngleY(angle) * n.mat;
                     uniforms_ptr->col = glm::vec4(n.col, 1.f);
                     uniforms_ptr++;
                 }
