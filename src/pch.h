@@ -2,8 +2,10 @@
 #include <fstream>
 #include <iostream>
 
+#define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
 #define VK_USE_PLATFORM_WIN32_KHR
-#include <vulkan/vulkan.hpp>
+#define VK_ENABLE_BETA_EXTENSIONS
+#include "vulkan.hpp"
 
 #include <windows.h>
 #include <stb_image.h>

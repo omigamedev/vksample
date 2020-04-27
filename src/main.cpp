@@ -13,6 +13,8 @@ static uint32_t device_family = 0;
 static vk::PhysicalDevice physical_device;
 static vk::Queue q;
 
+VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE;
+
 struct uniform_buffers_t
 {
     glm::mat4 model;
@@ -23,6 +25,23 @@ struct uniform_buffers_t
     
     glm::vec4 col;
     uint8_t pad3[0x100 - sizeof(col) & ~0x100]; // alignment
+};
+
+struct uniform_buffers_comp_t
+{
+    glm::vec4 camera;
+    glm::vec4 light_pos;
+    static constexpr uint32_t size = sizeof(camera) + sizeof(light_pos);
+    uint8_t pad3[0x100 - size & ~0x100]; // alignment
+};
+
+struct uniform_rt_buffers_t
+{
+    glm::mat4 view_inverse;
+    glm::mat4 proj_inverse;
+    glm::vec4 color;
+    static constexpr uint32_t mvp_size = sizeof(view_inverse) + sizeof(proj_inverse);
+    uint8_t pad2[0x100 - mvp_size & ~0x100]; // alignment
 };
 
 LRESULT WINAPI main_window_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -47,18 +66,25 @@ void find_device()
     std::vector<vk::PhysicalDevice> physical_devices = instance->enumeratePhysicalDevices();
     for (const auto& pd : physical_devices)
     {
+        auto pd_props = pd.getProperties();
         auto props = pd.getQueueFamilyProperties();
         for (int family_index = 0; family_index < props.size(); family_index++)
         {
             bool support_graphics = (bool)(props[family_index].queueFlags & vk::QueueFlagBits::eGraphics);
             bool support_present = pd.getSurfaceSupportKHR(family_index, *surface);
-            if (support_graphics && support_present)
+            if (support_graphics && support_present && pd_props.deviceType == vk::PhysicalDeviceType::eDiscreteGpu)
             {
                 std::array<const char*, 0> device_layers{
                 };
-                std::array<const char*, 1> device_extensions{
+                std::vector<const char*> device_extensions{
                     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+                    VK_NV_RAY_TRACING_EXTENSION_NAME,
                 };
+                // Add debug names extension which is available only when it's profiled
+                for (auto ext : pd.enumerateDeviceExtensionProperties())
+                    if (strcmp(ext.extensionName, VK_EXT_DEBUG_MARKER_EXTENSION_NAME) == 0)
+                        device_extensions.push_back(VK_EXT_DEBUG_MARKER_EXTENSION_NAME);
+
                 std::array<float, 1> queue_priorities{ 1.f };
                 vk::DeviceQueueCreateInfo queue_info;
                 queue_info.queueFamilyIndex = family_index;
@@ -91,7 +117,7 @@ uint32_t find_memory(const vk::MemoryRequirements& req, vk::MemoryPropertyFlags 
     throw std::runtime_error("find_memory failed");
 }
 
-auto create_gbuffer(const vk::Extent2D& extent, vk::Format format)
+auto create_gbuffer(const std::string& name, const vk::Extent2D& extent, vk::Format format, vk::ImageUsageFlags usage)
 {
     vk::ImageCreateInfo info;
     info.imageType = vk::ImageType::e2D;
@@ -101,12 +127,14 @@ auto create_gbuffer(const vk::Extent2D& extent, vk::Format format)
     info.arrayLayers = 1;
     info.samples = vk::SampleCountFlagBits::e1;
     info.tiling = vk::ImageTiling::eOptimal;
-    info.usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eInputAttachment;
+    info.usage = usage;
     info.initialLayout = vk::ImageLayout::eUndefined;
     vk::UniqueImage image = device->createImageUnique(info);
+    debug_name(image, name + " Image");
     vk::MemoryRequirements mem_req = device->getImageMemoryRequirements(*image);
     uint32_t mem_idx = find_memory(mem_req, vk::MemoryPropertyFlagBits::eDeviceLocal);
     vk::UniqueDeviceMemory mem = device->allocateMemoryUnique({ mem_req.size, mem_idx });
+    debug_name(mem, name + " Memory");
     device->bindImageMemory(*image, *mem, 0);
     vk::ImageViewCreateInfo view_info;
     view_info.image = *image;
@@ -118,6 +146,7 @@ auto create_gbuffer(const vk::Extent2D& extent, vk::Format format)
     view_info.subresourceRange.layerCount = 1;
     view_info.subresourceRange.levelCount = 1;
     vk::UniqueImageView view = device->createImageViewUnique(view_info);
+    debug_name(view, name + " View");
     return std::tuple(std::move(image), std::move(mem), std::move(view));
 }
 
@@ -157,9 +186,13 @@ void change_layout(const vk::UniqueImage& image, vk::ImageLayout src, vk::ImageL
     cmd_info.commandPool = *cmdpool;
     cmd_info.level = vk::CommandBufferLevel::ePrimary;
     cmd_info.commandBufferCount = 1;
-    std::vector<vk::UniqueCommandBuffer> cmd = device->allocateCommandBuffersUnique(cmd_info);
-    cmd[0]->begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+    vk::UniqueCommandBuffer cmd = std::move(
+        device->allocateCommandBuffersUnique(cmd_info)[0]);
+    debug_name(cmd, "Change Layout OneTime Command");
+    cmd->begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
     {
+        debug_mark_insert(cmd, "Change Image Layout");
+
         vk::ImageMemoryBarrier barrier;
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -177,15 +210,15 @@ void change_layout(const vk::UniqueImage& image, vk::ImageLayout src, vk::ImageL
         barrier.dstAccessMask = dstAccessMask;
         barrier.oldLayout = src;
         barrier.newLayout = dst;
-        cmd[0]->pipelineBarrier(srcStageMask, dstStageMask,
+        cmd->pipelineBarrier(srcStageMask, dstStageMask,
             vk::DependencyFlagBits::eByRegion, nullptr, nullptr, barrier);
     }
-    cmd[0]->end();
+    cmd->end();
 
     vk::UniqueFence submit_fence = device->createFenceUnique({});
     vk::SubmitInfo submit_info;
     submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &cmd[0].get();
+    submit_info.pCommandBuffers = &cmd.get();
     q.submit(submit_info, *submit_fence);
     q.waitIdle();
 }
@@ -203,12 +236,19 @@ vk::UniqueShaderModule load_shader_module(const std::string& path)
     vk::ShaderModuleCreateInfo module_info;
     module_info.codeSize = size;
     module_info.pCode = reinterpret_cast<uint32_t*>(buffer.get());
-    return device->createShaderModuleUnique(module_info);
+    vk::UniqueShaderModule m = device->createShaderModuleUnique(module_info);
+    debug_name(m, "ShaderModule " + path);
+    return m;
 }
 
-int main()
+int main_run()
 {
     // Instance creation
+
+    vk::DynamicLoader dl;
+    PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr =
+        dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(vkGetInstanceProcAddr);
 
     vk::ApplicationInfo instance_app_info;
     instance_app_info.pApplicationName = "VulkanSample";
@@ -218,7 +258,8 @@ int main()
     instance_app_info.apiVersion = VK_VERSION_1_2;
     std::array<const char*, 2> instance_layers {
         "VK_LAYER_LUNARG_standard_validation",
-        "VK_LAYER_RENDERDOC_Capture",
+        "VK_LAYER_KHRONOS_validation",
+        //"VK_LAYER_RENDERDOC_Capture",
     };
     std::array<const char*, 4> instance_extensions{
         VK_KHR_SURFACE_EXTENSION_NAME,
@@ -233,10 +274,11 @@ int main()
     instance_info.enabledExtensionCount = (uint32_t)instance_extensions.size();
     instance_info.ppEnabledExtensionNames = instance_extensions.data();
     instance = vk::createInstanceUnique(instance_info);
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(*instance);
 
     // Debugging
     
-    init_debug_message(instance);
+    //auto debug_messenger = init_debug_message(instance);
 
     // Window/Surface creation
 
@@ -251,7 +293,7 @@ int main()
     RegisterClass(&wc);
     RECT window_rect = { 0, 0, 800, 600 };
     AdjustWindowRect(&window_rect, WS_OVERLAPPEDWINDOW, false);
-    HWND hWnd = CreateWindow(TEXT("MainWindow"), TEXT("VulkanSample"), WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    HWND hWnd = CreateWindow(TEXT("MainWindow"), TEXT("VulkanSample - RayTraced"), WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, window_rect.right - window_rect.left, 
         window_rect.bottom - window_rect.top, NULL, NULL, wc.hInstance, NULL);
 
@@ -263,8 +305,10 @@ int main()
     // Create device
 
     find_device();
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+
     auto pd_props = physical_device.getProperties();
-    std::string title = fmt::format("VulkanSample - {}", pd_props.deviceName);
+    std::string title = fmt::format("VulkanSample - RayTraced - {}", pd_props.deviceName);
     SetWindowTextA(hWnd, title.c_str());
 
     // Create Swapchain
@@ -284,6 +328,18 @@ int main()
     vk::UniqueSwapchainKHR swapchain = device->createSwapchainKHRUnique(swapchain_info);
     std::vector<vk::Image> swapchain_images = device->getSwapchainImagesKHR(*swapchain);
 
+    // Create gbuffers
+
+    auto [gbuffer_pos, gbuffer_pos_mem, gbuffer_pos_view] =
+        create_gbuffer("GBufferPOS", surface_caps.currentExtent, vk::Format::eR32G32B32A32Sfloat, 
+            vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eInputAttachment);
+    auto [gbuffer_nor, gbuffer_nor_mem, gbuffer_nor_view] =
+        create_gbuffer("GBufferNOR", surface_caps.currentExtent, vk::Format::eR32G32B32A32Sfloat,
+            vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eInputAttachment);
+    auto [gbuffer_alb, gbuffer_alb_mem, gbuffer_alb_view] =
+        create_gbuffer("GBufferALB", surface_caps.currentExtent, vk::Format::eR8G8B8A8Unorm,
+            vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eInputAttachment);
+
     // Load 3D model
 
     struct vertex_t
@@ -298,9 +354,15 @@ int main()
 
     struct mesh_t
     {
+        uint32_t id;
         uint32_t vtx_offset;
         uint32_t idx_offset;
         uint32_t idx_count;
+        vk::DeviceSize blas_offset;
+        vk::DeviceSize blas_size;
+        uint64_t blas_handle;
+        vk::UniqueAccelerationStructureNV blas;
+        vk::GeometryNV g;
     };
 
     struct node_t
@@ -314,12 +376,13 @@ int main()
     std::vector<uint32_t> mesh_data_idx;
 
     Assimp::Importer importer;
-    const aiScene* scene = importer.ReadFile("D:\\3D\\buildings.fbx", aiProcessPreset_TargetRealtime_Fast);
+    const aiScene* scene = importer.ReadFile("D:\\3D\\cars.fbx", aiProcessPreset_TargetRealtime_Fast);
     std::vector<mesh_t> meshes;
     for (uint32_t mesh_index = 0; mesh_index < scene->mNumMeshes; mesh_index++)
     {
         aiMesh* scene_mesh = scene->mMeshes[mesh_index];
         mesh_t& mesh = meshes.emplace_back();
+        mesh.id = mesh_index;
         mesh.idx_offset = (uint32_t)mesh_data_idx.size();
         mesh.idx_count = scene_mesh->mNumFaces * 3;
         mesh.vtx_offset = (uint32_t)mesh_data_vert.size();
@@ -350,6 +413,7 @@ int main()
             scene_node->mMeshes, 
             scene_node->mMeshes + scene_node->mNumMeshes);
     }
+    importer.FreeScene();
 
     // vertex buffer
     vk::BufferCreateInfo triangle_buffer_info;
@@ -383,16 +447,325 @@ int main()
         device->unmapMemory(*triangle_buffer_idx_mem);
     }
 
-    // Create useful global objects
-    
+    // Create Queue and Pools
+
     q = device->getQueue(device_family, 0);
     cmdpool = device->createCommandPoolUnique({ {}, device_family });
-    std::array<vk::DescriptorPoolSize, 2> descrpool_sizes {
-        vk::DescriptorPoolSize{ vk::DescriptorType::eUniformBuffer, (uint32_t)nodes.size() * 2 },
+    std::array<vk::DescriptorPoolSize, 4> descrpool_sizes{
+        vk::DescriptorPoolSize{ vk::DescriptorType::eUniformBuffer, (uint32_t)nodes.size() * 3 },
         vk::DescriptorPoolSize{ vk::DescriptorType::eInputAttachment, 4 },
+        vk::DescriptorPoolSize{ vk::DescriptorType::eAccelerationStructureNV, 1 },
+        vk::DescriptorPoolSize{ vk::DescriptorType::eStorageImage, 1 },
     };
-    descrpool = device->createDescriptorPoolUnique({ {}, (uint32_t)nodes.size() + 1, 
+    uint32_t pool_size =
+        (uint32_t)nodes.size()  // geometry pass
+        + 1                     // composition
+        + 1                     // raytracing
+    ;
+    uint32_t pool_size_comp = 1;
+    uint32_t pool_size_rt = 1;
+    descrpool = device->createDescriptorPoolUnique({ {}, pool_size,
         (uint32_t)descrpool_sizes.size(), descrpool_sizes.data() });
+
+    // Create RT objects
+
+    auto rt_props = physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceRayTracingPropertiesNV>()
+        .get<vk::PhysicalDeviceRayTracingPropertiesNV>();
+    
+    // BLAS
+    vk::DeviceSize blas_mem_size = 0;
+    vk::DeviceSize scratch_size = 0;
+    vk::MemoryRequirements2 blas_mem_req;
+    for (auto& m : meshes)
+    {
+        m.g.geometryType = vk::GeometryTypeNV::eTriangles;
+        m.g.geometry.triangles.vertexData = *triangle_buffer;
+        m.g.geometry.triangles.vertexOffset = m.vtx_offset * sizeof(vertex_t);
+        m.g.geometry.triangles.vertexCount = m.idx_count * 3;
+        m.g.geometry.triangles.vertexStride = sizeof(vertex_t);
+        m.g.geometry.triangles.vertexFormat = vk::Format::eR32G32B32Sfloat;
+        m.g.geometry.triangles.indexData = *triangle_buffer_idx;
+        m.g.geometry.triangles.indexOffset = m.idx_offset * sizeof(uint32_t);
+        m.g.geometry.triangles.indexCount = m.idx_count;
+        m.g.geometry.triangles.indexType = vk::IndexType::eUint32;
+        m.g.flags = vk::GeometryFlagBitsNV::eOpaque;
+
+        vk::AccelerationStructureCreateInfoNV blas_info;
+        blas_info.info.type = vk::AccelerationStructureTypeNV::eBottomLevel;
+        blas_info.info.instanceCount = 0;
+        blas_info.info.geometryCount = 1;
+        blas_info.info.pGeometries = &m.g;
+        m.blas = device->createAccelerationStructureNVUnique(blas_info);
+        debug_name(m.blas, fmt::format("BLAS mesh#{}", m.id));
+
+        blas_mem_req = device->getAccelerationStructureMemoryRequirementsNV({
+            vk::AccelerationStructureMemoryRequirementsTypeNV::eObject, *m.blas });
+        m.blas_offset = blas_mem_size;
+        m.blas_size = blas_mem_req.memoryRequirements.size;
+        blas_mem_size += m.blas_size;
+
+        vk::MemoryRequirements2 scratch_req = device->getAccelerationStructureMemoryRequirementsNV({
+            vk::AccelerationStructureMemoryRequirementsTypeNV::eBuildScratch, *m.blas });
+        scratch_size = std::max(scratch_size, scratch_req.memoryRequirements.size);
+    }
+    
+    uint32_t blas_mem_idx = find_memory(blas_mem_req.memoryRequirements, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    vk::UniqueDeviceMemory blas_mem = device->allocateMemoryUnique({ blas_mem_size, blas_mem_idx });
+    debug_name(blas_mem, "BLAS Memory");
+
+    for (auto& m : meshes)
+    {
+        device->bindAccelerationStructureMemoryNV({ { *m.blas, *blas_mem, m.blas_offset } });
+        device->getAccelerationStructureHandleNV<uint64_t>(*m.blas, m.blas_handle);
+    }
+
+
+    // TLAS
+    std::vector<vk::AccelerationStructureInstanceNV> rt_instances;
+    for (const auto& n : nodes)
+    {
+        for (const auto& mesh_index : n.mesh_indices)
+        {
+            auto& inst = rt_instances.emplace_back();
+            // glm:column-major to NV:row-major
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 4; j++)
+                    inst.transform.matrix[i][j] = n.mat[j][i];
+            inst.instanceCustomIndex = rt_instances.size() - 1;
+            inst.mask = 0xFF;
+            inst.instanceShaderBindingTableRecordOffset = 0;
+            inst.flags = (uint8_t)vk::GeometryInstanceFlagBitsNV::eTriangleCullDisable;
+            inst.accelerationStructureReference = meshes[mesh_index].blas_handle;
+        }
+    }
+    vk::AccelerationStructureCreateInfoNV tlas_info;
+    tlas_info.info.type = vk::AccelerationStructureTypeNV::eTopLevel;
+    tlas_info.info.instanceCount = (uint32_t)rt_instances.size();
+    vk::UniqueAccelerationStructureNV tlas = device->createAccelerationStructureNVUnique(tlas_info);
+    debug_name(tlas, "TLAS");
+
+    vk::MemoryRequirements2 tlas_mem_req = device->getAccelerationStructureMemoryRequirementsNV({
+        vk::AccelerationStructureMemoryRequirementsTypeNV::eObject, *tlas });
+    uint32_t tlas_mem_idx = find_memory(tlas_mem_req.memoryRequirements, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    vk::UniqueDeviceMemory tlas_mem = device->allocateMemoryUnique({ tlas_mem_req.memoryRequirements.size, tlas_mem_idx });
+    debug_name(tlas_mem, "TLAS Memory");
+    device->bindAccelerationStructureMemoryNV({ {*tlas, *tlas_mem, 0} });
+
+    uint64_t tlas_handle{};
+    device->getAccelerationStructureHandleNV<uint64_t>(*tlas, tlas_handle);
+
+    // Scratch buffer
+    vk::MemoryRequirements2 tlas_scratch_req = device->getAccelerationStructureMemoryRequirementsNV({
+        vk::AccelerationStructureMemoryRequirementsTypeNV::eBuildScratch, *tlas });
+    uint32_t tlas_scratch_idx = find_memory(tlas_scratch_req.memoryRequirements, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    scratch_size = std::max(scratch_size, tlas_scratch_req.memoryRequirements.size);
+    vk::UniqueDeviceMemory scratch_mem = device->allocateMemoryUnique({ scratch_size, tlas_scratch_idx });
+    debug_name(scratch_mem, "Scratch Buffer Memory");
+
+    vk::BufferCreateInfo scratch_buffer_info;
+    scratch_buffer_info.size = scratch_size;
+    scratch_buffer_info.usage = vk::BufferUsageFlagBits::eRayTracingNV;
+    vk::UniqueBuffer scratch_buffer = device->createBufferUnique(scratch_buffer_info);
+    debug_name(scratch_buffer, "Scratch Buffer");
+    device->bindBufferMemory(*scratch_buffer, *scratch_mem, 0);
+
+    // Instance buffer
+    vk::BufferCreateInfo instance_buffer_info;
+    instance_buffer_info.size = rt_instances.size() * sizeof(vk::AccelerationStructureInstanceNV);
+    instance_buffer_info.usage = vk::BufferUsageFlagBits::eRayTracingNV;
+    vk::UniqueBuffer instance_buffer = device->createBufferUnique(instance_buffer_info);
+    debug_name(instance_buffer, "Instance Buffer");
+    vk::MemoryRequirements instance_buffer_mem_req = device->getBufferMemoryRequirements(*instance_buffer);
+    uint32_t instance_buffer_mem_idx = find_memory(instance_buffer_mem_req,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    vk::UniqueDeviceMemory instance_buffer_mem = device->allocateMemoryUnique({ instance_buffer_mem_req.size, triangle_buffer_idx_mem_idx });
+    debug_name(instance_buffer_mem, "Instance Buffer Memory");
+    device->bindBufferMemory(*instance_buffer, *instance_buffer_mem, 0);
+    if (auto* ptr = reinterpret_cast<vk::AccelerationStructureInstanceNV*>(device->mapMemory(*instance_buffer_mem, 0, VK_WHOLE_SIZE)))
+    {
+        std::copy(rt_instances.begin(), rt_instances.end(), ptr);
+        device->unmapMemory(*instance_buffer_mem);
+    }
+
+    // Build AS
+
+    vk::UniqueCommandBuffer cmd_builder = std::move(
+        device->allocateCommandBuffersUnique({ *cmdpool, vk::CommandBufferLevel::ePrimary, 1 })[0]);
+    debug_name(cmd_builder, "AS Build Command");
+    cmd_builder->begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+    debug_mark_insert(cmd_builder, "Build BLAS");
+    for (const auto& m : meshes)
+    {
+        debug_mark_begin(cmd_builder, fmt::format("Build Mesh#{}", m.id));
+        
+        vk::AccelerationStructureInfoNV info;
+        info.type = vk::AccelerationStructureTypeNV::eBottomLevel;
+        info.flags = vk::BuildAccelerationStructureFlagBitsNV::ePreferFastTrace;
+        info.geometryCount = 1;
+        info.pGeometries = &m.g;
+        cmd_builder->buildAccelerationStructureNV(
+            info, nullptr, 0, false, *m.blas, nullptr, *scratch_buffer, 0);
+
+        vk::MemoryBarrier barrier(vk::AccessFlagBits::eAccelerationStructureWriteNV,
+            vk::AccessFlagBits::eAccelerationStructureReadNV);
+        cmd_builder->pipelineBarrier(vk::PipelineStageFlagBits::eAccelerationStructureBuildNV,
+            vk::PipelineStageFlagBits::eAccelerationStructureBuildNV,
+            vk::DependencyFlags(), { barrier }, {}, {});
+        
+        debug_mark_end(cmd_builder);
+    }
+    vk::AccelerationStructureInfoNV build_tlas_info;
+    build_tlas_info.type = vk::AccelerationStructureTypeNV::eBottomLevel;
+    build_tlas_info.flags = vk::BuildAccelerationStructureFlagBitsNV::ePreferFastTrace;
+    build_tlas_info.instanceCount = (uint32_t)rt_instances.size();
+    debug_mark_insert(cmd_builder, "Build TLAS");
+    cmd_builder->buildAccelerationStructureNV(
+        build_tlas_info, *instance_buffer, 0, false, *tlas, nullptr, *scratch_buffer, 0);
+    cmd_builder->end();
+
+    vk::SubmitInfo cmd_build_submit;
+    cmd_build_submit.commandBufferCount = 1;
+    cmd_build_submit.pCommandBuffers = &cmd_builder.get();
+    q.submit(cmd_build_submit, nullptr);
+    q.waitIdle();
+
+    // RT Pipeline
+
+    // DescriptorSet Layout
+    std::array<vk::DescriptorSetLayoutBinding, 3> rt_descrset_layout_bindings{
+        vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eAccelerationStructureNV, 1, vk::ShaderStageFlagBits::eRaygenNV),
+        vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eRaygenNV),
+        vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eRaygenNV),
+    };
+    vk::DescriptorSetLayoutCreateInfo rt_descrset_layout_info;
+    rt_descrset_layout_info.bindingCount = (uint32_t)rt_descrset_layout_bindings.size();
+    rt_descrset_layout_info.pBindings = rt_descrset_layout_bindings.data();
+    vk::UniqueDescriptorSetLayout rt_descrset_layout = device->createDescriptorSetLayoutUnique(rt_descrset_layout_info);    
+    debug_name(rt_descrset_layout, "RT Descriptor Set Layout");
+
+    // Allocate DescriptorSets
+    vk::UniqueDescriptorSet rt_descr_sets = std::move(
+        device->allocateDescriptorSetsUnique({ *descrpool, 1, &rt_descrset_layout.get() })[0]);
+    debug_name(rt_descr_sets, "RT Descriptor Set");
+
+    // Create Uniform Buffer
+    vk::BufferCreateInfo uniform_rt_buffer_info;
+    uniform_rt_buffer_info.size = sizeof(uniform_rt_buffers_t);
+    uniform_rt_buffer_info.usage = vk::BufferUsageFlagBits::eUniformBuffer;
+    vk::UniqueBuffer uniform_rt_buffer = device->createBufferUnique(uniform_rt_buffer_info);
+    debug_name(uniform_rt_buffer, "RT Uniform Buffer");
+    vk::MemoryRequirements uniform_rt_mem_req = device->getBufferMemoryRequirements(*uniform_rt_buffer);
+    uint32_t uniform_rt_mem_idx = find_memory(uniform_rt_mem_req,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    vk::UniqueDeviceMemory uniform_rt_mem = device->allocateMemoryUnique({ uniform_rt_mem_req.size, uniform_rt_mem_idx });
+    debug_name(uniform_rt_mem, "RT Uniform Buffer Memory");
+    device->bindBufferMemory(*uniform_rt_buffer, *uniform_rt_mem, 0);
+    if (auto ptr = reinterpret_cast<uniform_rt_buffers_t*>(device->mapMemory(*uniform_rt_mem, 0, VK_WHOLE_SIZE)))
+    {
+        float aspect = (float)surface_caps.currentExtent.width / (float)surface_caps.currentExtent.height;
+        glm::mat4 proj = glm::perspective(glm::radians(85.f), aspect, .1f, 100.f);
+        glm::mat4 view = glm::identity<glm::mat4>();
+        ptr->proj_inverse = glm::inverse(proj);
+        ptr->view_inverse = glm::inverse(view);
+        ptr->color = glm::vec4(0, 0, 0, 1);
+        device->unmapMemory(*uniform_rt_mem);
+    }
+
+    // Create Output Image
+    auto [rt_output, rt_output_mem, rt_output_view] =
+        create_gbuffer("GBufferPOS", surface_caps.currentExtent, vk::Format::eR8G8B8A8Unorm,
+            vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eStorage);
+
+    // Update DescriptorSets
+    vk::DescriptorImageInfo rt_descr_set_image(nullptr, *rt_output_view, vk::ImageLayout::eGeneral);
+    vk::DescriptorBufferInfo rt_descr_set_ubo(*uniform_rt_buffer, 0, uniform_rt_buffers_t::mvp_size);
+    vk::StructureChain rt_descr_set_tlas_chain(
+        vk::WriteDescriptorSet(*rt_descr_sets, 0, 0, 1, vk::DescriptorType::eAccelerationStructureNV),
+        vk::WriteDescriptorSetAccelerationStructureNV(1, &tlas.get())
+    );
+    std::array<vk::WriteDescriptorSet, 3> rt_descr_set_write{
+        rt_descr_set_tlas_chain.get<vk::WriteDescriptorSet>(),
+        vk::WriteDescriptorSet(*rt_descr_sets, 1, 0, 1, vk::DescriptorType::eStorageImage, &rt_descr_set_image),
+        vk::WriteDescriptorSet(*rt_descr_sets, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &rt_descr_set_ubo),
+    };
+    device->updateDescriptorSets(rt_descr_set_write, nullptr);
+
+    // Pipeline Layout
+    vk::PipelineLayoutCreateInfo rt_pipeline_layout_info;
+    rt_pipeline_layout_info.setLayoutCount = 1;
+    rt_pipeline_layout_info.pSetLayouts = &rt_descrset_layout.get();
+    rt_pipeline_layout_info.pushConstantRangeCount = 0;
+    vk::UniquePipelineLayout rt_pipeline_layout = device->createPipelineLayoutUnique(rt_pipeline_layout_info);
+    debug_name(rt_pipeline_layout, "RT Pipeline Layout");
+
+    // Ray-tracing Pipeline
+    
+    // Load shaders
+    vk::UniqueShaderModule module_trace_rgen = load_shader_module("shaders/trace.rgen.spv");
+    vk::UniqueShaderModule module_trace_rmiss = load_shader_module("shaders/trace.rmiss.spv");
+    vk::UniqueShaderModule module_trace_rchit = load_shader_module("shaders/trace.rchit.spv");
+    std::array<vk::PipelineShaderStageCreateInfo, 3> rt_pipeline_stages{
+        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eRaygenNV, *module_trace_rgen, "main"),
+        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eMissNV, *module_trace_rmiss, "main"),
+        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eClosestHitNV, *module_trace_rchit, "main"),
+    };
+
+    // Shader groups
+    std::array<vk::RayTracingShaderGroupCreateInfoNV, 3> rt_groups{
+        vk::RayTracingShaderGroupCreateInfoNV(vk::RayTracingShaderGroupTypeNV::eGeneral,
+            0, VK_SHADER_UNUSED_NV, VK_SHADER_UNUSED_NV, VK_SHADER_UNUSED_NV),
+        vk::RayTracingShaderGroupCreateInfoNV(vk::RayTracingShaderGroupTypeNV::eGeneral,
+            1, VK_SHADER_UNUSED_NV, VK_SHADER_UNUSED_NV, VK_SHADER_UNUSED_NV),
+        vk::RayTracingShaderGroupCreateInfoNV(vk::RayTracingShaderGroupTypeNV::eTrianglesHitGroup,
+            VK_SHADER_UNUSED_NV, 2, VK_SHADER_UNUSED_NV, VK_SHADER_UNUSED_NV),
+    };
+
+    // Ray-tracing Pipeline
+    vk::RayTracingPipelineCreateInfoNV rt_pipeline_info;
+    rt_pipeline_info.stageCount = (uint32_t)rt_pipeline_stages.size();
+    rt_pipeline_info.pStages = rt_pipeline_stages.data();
+    rt_pipeline_info.groupCount = (uint32_t)rt_groups.size();
+    rt_pipeline_info.pGroups = rt_groups.data();
+    rt_pipeline_info.maxRecursionDepth = 1;
+    rt_pipeline_info.layout = *rt_pipeline_layout;
+    vk::UniquePipeline rt_pipeline = device->createRayTracingPipelineNVUnique(nullptr, rt_pipeline_info);
+    debug_name(rt_pipeline, "RT Pipeline");
+
+    // Shaders Binding Table
+
+    // Create Buffer
+    vk::BufferCreateInfo sbt_buffer_info;
+    sbt_buffer_info.size = rt_props.shaderGroupHandleSize * rt_pipeline_stages.size();
+    sbt_buffer_info.usage = vk::BufferUsageFlagBits::eRayTracingNV;
+    vk::UniqueBuffer sbt_buffer = device->createBufferUnique(sbt_buffer_info);
+    debug_name(sbt_buffer, "SBT Buffer");
+    vk::MemoryRequirements sbt_buffer_mem_req = device->getBufferMemoryRequirements(*sbt_buffer);
+    uint32_t sbt_buffer_mem_idx = find_memory(sbt_buffer_mem_req,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    vk::UniqueDeviceMemory sbt_buffer_mem = device->allocateMemoryUnique({ sbt_buffer_mem_req.size, sbt_buffer_mem_idx });
+    debug_name(sbt_buffer_mem, "SBT Buffer Memory");
+    device->bindBufferMemory(*sbt_buffer, *sbt_buffer_mem, 0);
+    if (auto ptr = reinterpret_cast<uint8_t*>(device->mapMemory(*sbt_buffer_mem, 0, VK_WHOLE_SIZE)))
+    {
+        device->getRayTracingShaderGroupHandlesNV<uint8_t>(*rt_pipeline, 0, (uint32_t)rt_pipeline_stages.size(), { (uint32_t)sbt_buffer_info.size, ptr });
+        device->unmapMemory(*sbt_buffer_mem);
+    }
+
+    vk::UniqueCommandBuffer cmd_trace = std::move(
+        device->allocateCommandBuffersUnique({ *cmdpool, vk::CommandBufferLevel::ePrimary, 1 })[0]);
+    debug_name(cmd_trace, "cmd_trace");
+    cmd_trace->begin({ { vk::CommandBufferUsageFlags() } });
+    cmd_trace->bindPipeline(vk::PipelineBindPoint::eRayTracingNV, *rt_pipeline);
+    cmd_trace->bindDescriptorSets(vk::PipelineBindPoint::eRayTracingNV, 
+        *rt_pipeline_layout, 0, *rt_descr_sets, nullptr);
+    debug_mark_insert(cmd_trace, "Trace Rays");
+    cmd_trace->traceRaysNV(
+        *sbt_buffer, rt_props.shaderGroupHandleSize * 0,
+        *sbt_buffer, rt_props.shaderGroupHandleSize * 1, rt_props.shaderGroupHandleSize,
+        *sbt_buffer, rt_props.shaderGroupHandleSize * 2, rt_props.shaderGroupHandleSize,
+        nullptr, 0, 0,
+        surface_caps.currentExtent.width, surface_caps.currentExtent.height, 1);
+    cmd_trace->end();
 
     // Load the image into a staging vulkan image
 
@@ -410,7 +783,8 @@ int main()
     image_info.usage = vk::ImageUsageFlagBits::eTransferSrc;
     image_info.initialLayout = vk::ImageLayout::ePreinitialized;
     vk::UniqueImage image = device->createImageUnique(image_info);
-    
+    debug_name(image, "image.png Image");
+
     vk::SubresourceLayout image_layout = device->getImageSubresourceLayout(*image, 
         vk::ImageSubresource(vk::ImageAspectFlagBits::eColor, 0, 0));
     
@@ -420,6 +794,7 @@ int main()
     image_mem_info.memoryTypeIndex = find_memory(image_mem_req, 
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
     vk::UniqueDeviceMemory image_mem = device->allocateMemoryUnique(image_mem_info);
+    debug_name(image_mem, "image.png Memory");
 
     device->bindImageMemory(*image, *image_mem, 0);
 
@@ -442,38 +817,35 @@ int main()
     descrset_layout_info.bindingCount = (uint32_t)descrset_layout_bindings.size();
     descrset_layout_info.pBindings = descrset_layout_bindings.data();
     vk::UniqueDescriptorSetLayout descrset_layout = device->createDescriptorSetLayoutUnique(descrset_layout_info);
+    debug_name(descrset_layout, "GEO DescriptorSet Layout");
+
     vk::PipelineLayoutCreateInfo pipeline_layout_info;
     pipeline_layout_info.setLayoutCount = 1;
     pipeline_layout_info.pSetLayouts = &descrset_layout.get();
     pipeline_layout_info.pushConstantRangeCount = 0;
     vk::UniquePipelineLayout pipeline_layout = device->createPipelineLayoutUnique(pipeline_layout_info);
+    debug_name(pipeline_layout, "GEO Pipeline Layout");
 
     // Create PipelineLayout Composite
 
-    std::array<vk::DescriptorSetLayoutBinding, 4> descrset_comp_layout_bindings {
-        vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
+    std::array<vk::DescriptorSetLayoutBinding, 5> descrset_comp_layout_bindings {
+        vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eFragment),
         vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
         vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
         vk::DescriptorSetLayoutBinding(3, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
+        vk::DescriptorSetLayoutBinding(4, vk::DescriptorType::eInputAttachment, 1, vk::ShaderStageFlagBits::eFragment),
     };
     vk::DescriptorSetLayoutCreateInfo descrset_comp_layout_info;
     descrset_comp_layout_info.bindingCount = (uint32_t)descrset_comp_layout_bindings.size();
     descrset_comp_layout_info.pBindings = descrset_comp_layout_bindings.data();
     vk::UniqueDescriptorSetLayout descrset_comp_layout = device->createDescriptorSetLayoutUnique(descrset_comp_layout_info);
+    debug_name(descrset_comp_layout, "COMP DescriptorSet Layout");
     vk::PipelineLayoutCreateInfo pipeline_comp_layout_info;
     pipeline_comp_layout_info.setLayoutCount = 1;
     pipeline_comp_layout_info.pSetLayouts = &descrset_comp_layout.get();
     pipeline_comp_layout_info.pushConstantRangeCount = 0;
     vk::UniquePipelineLayout pipeline_comp_layout = device->createPipelineLayoutUnique(pipeline_comp_layout_info);
-
-    // Create gbuffers
-
-    auto [gbuffer_pos, gbuffer_pos_mem, gbuffer_pos_view] =
-        create_gbuffer(surface_caps.currentExtent, vk::Format::eR32G32B32A32Sfloat);
-    auto [gbuffer_nor, gbuffer_nor_mem, gbuffer_nor_view] =
-        create_gbuffer(surface_caps.currentExtent, vk::Format::eR32G32B32A32Sfloat);
-    auto [gbuffer_alb, gbuffer_alb_mem, gbuffer_alb_view] =
-        create_gbuffer(surface_caps.currentExtent, vk::Format::eR8G8B8A8Unorm);
+    debug_name(pipeline_comp_layout, "COMP Pipeline Layout");
 
     // Create depth image
 
@@ -488,9 +860,11 @@ int main()
     depth_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eInputAttachment;
     depth_info.initialLayout = vk::ImageLayout::eUndefined;
     vk::UniqueImage depth = device->createImageUnique(depth_info);
+    debug_name(depth, "Depth Image");
     vk::MemoryRequirements depth_mem_req = device->getImageMemoryRequirements(*depth);
     uint32_t depth_mem_idx = find_memory(depth_mem_req, vk::MemoryPropertyFlagBits::eDeviceLocal);
     vk::UniqueDeviceMemory depth_mem = device->allocateMemoryUnique({ depth_mem_req.size, depth_mem_idx });
+    debug_name(depth_mem, "Depth Image Memory");
     device->bindImageMemory(*depth, *depth_mem, 0);
         vk::ImageViewCreateInfo depth_view_info;
     depth_view_info.image = *depth;
@@ -502,6 +876,7 @@ int main()
     depth_view_info.subresourceRange.layerCount = 1;
     depth_view_info.subresourceRange.levelCount = 1;
     vk::UniqueImageView depth_view = device->createImageViewUnique(depth_view_info);
+    debug_name(depth_view, "Depth View");
 
     // Create DescriptorSets
 
@@ -509,10 +884,12 @@ int main()
     uniform_buffer_info.size = sizeof(uniform_buffers_t) * nodes.size();
     uniform_buffer_info.usage = vk::BufferUsageFlagBits::eUniformBuffer;
     vk::UniqueBuffer uniform_buffer = device->createBufferUnique(uniform_buffer_info);
+    debug_name(uniform_buffer, "GEO Uniform Buffer");
     vk::MemoryRequirements uniform_mem_req = device->getBufferMemoryRequirements(*uniform_buffer);
     uint32_t uniform_mem_idx = find_memory(uniform_mem_req,
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
     vk::UniqueDeviceMemory uniform_mem = device->allocateMemoryUnique({ uniform_mem_req.size, uniform_mem_idx });
+    debug_name(uniform_mem, "GEO Uniform Buffer Memory");
     device->bindBufferMemory(*uniform_buffer, *uniform_mem, 0);
 
     std::vector<vk::DescriptorSetLayout> descr_sets_layouts(nodes.size(), *descrset_layout);
@@ -525,6 +902,8 @@ int main()
     descr_sets_write.reserve(nodes.size() * 2);
     for (uint32_t node_index = 0; node_index < nodes.size(); node_index++)
     {
+        debug_name(descr_sets[node_index], fmt::format("GEO DescriptorSet node#{}", node_index));
+
         // model, view, proj
         vk::DeviceSize buffer_offset = node_index * sizeof(uniform_buffers_t);
         descr_sets_buffer.emplace_back(*uniform_buffer, 
@@ -541,21 +920,37 @@ int main()
 
     // Create DescriptorSets Composite
 
-    std::vector<vk::UniqueDescriptorSet> descr_sets_comp = 
-        device->allocateDescriptorSetsUnique({ *descrpool, 1, &descrset_comp_layout.get() });
+    vk::BufferCreateInfo uniform_comp_buffer_info;
+    uniform_comp_buffer_info.size = sizeof(uniform_buffers_comp_t);
+    uniform_comp_buffer_info.usage = vk::BufferUsageFlagBits::eUniformBuffer;
+    vk::UniqueBuffer uniform_buffer_comp = device->createBufferUnique(uniform_comp_buffer_info);
+    debug_name(uniform_buffer_comp, "COMP Uniform Buffer");
+    vk::MemoryRequirements uniform_comp_mem_req = device->getBufferMemoryRequirements(*uniform_buffer_comp);
+    uint32_t uniform_comp_mem_idx = find_memory(uniform_comp_mem_req,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    vk::UniqueDeviceMemory uniform_comp_mem = device->allocateMemoryUnique({ uniform_comp_mem_req.size, uniform_comp_mem_idx });
+    debug_name(uniform_comp_mem, "COMP Uniform Buffer Memory");
+    device->bindBufferMemory(*uniform_buffer_comp, *uniform_comp_mem, 0);
 
+    vk::UniqueDescriptorSet descr_sets_comp = std::move(
+        device->allocateDescriptorSetsUnique({ *descrpool, 1, &descrset_comp_layout.get() })[0]);
+    debug_name(descr_sets_comp, "COMP DescriptorSet");
+
+    vk::DescriptorBufferInfo descr_sets_comp_buffer(*uniform_buffer_comp, 0, sizeof(uniform_buffers_comp_t));
     vk::DescriptorImageInfo descr_sets_comp_depth(nullptr, *depth_view, vk::ImageLayout::eShaderReadOnlyOptimal);
     vk::DescriptorImageInfo descr_sets_comp_pos(nullptr, *gbuffer_pos_view, vk::ImageLayout::eShaderReadOnlyOptimal);
     vk::DescriptorImageInfo descr_sets_comp_nor(nullptr, *gbuffer_nor_view, vk::ImageLayout::eShaderReadOnlyOptimal);
     vk::DescriptorImageInfo descr_sets_comp_alb(nullptr, *gbuffer_alb_view, vk::ImageLayout::eShaderReadOnlyOptimal);
-    std::array<vk::WriteDescriptorSet, 4> descr_sets_comp_write{
-        vk::WriteDescriptorSet(*descr_sets_comp[0], 0, 0, 1,
+    std::array<vk::WriteDescriptorSet, 5> descr_sets_comp_write{
+        vk::WriteDescriptorSet(*descr_sets_comp, 0, 0, 1,
+            vk::DescriptorType::eUniformBuffer, nullptr, &descr_sets_comp_buffer, nullptr),
+        vk::WriteDescriptorSet(*descr_sets_comp, 1, 0, 1,
             vk::DescriptorType::eInputAttachment, &descr_sets_comp_depth, nullptr, nullptr),
-        vk::WriteDescriptorSet(*descr_sets_comp[0], 1, 0, 1,
+        vk::WriteDescriptorSet(*descr_sets_comp, 2, 0, 1,
             vk::DescriptorType::eInputAttachment, &descr_sets_comp_pos, nullptr, nullptr),
-        vk::WriteDescriptorSet(*descr_sets_comp[0], 2, 0, 1,
+        vk::WriteDescriptorSet(*descr_sets_comp, 3, 0, 1,
             vk::DescriptorType::eInputAttachment, &descr_sets_comp_nor, nullptr, nullptr),
-        vk::WriteDescriptorSet(*descr_sets_comp[0], 3, 0, 1,
+        vk::WriteDescriptorSet(*descr_sets_comp, 4, 0, 1,
             vk::DescriptorType::eInputAttachment, &descr_sets_comp_alb, nullptr, nullptr),
     };
     device->updateDescriptorSets(descr_sets_comp_write, nullptr);
@@ -670,6 +1065,7 @@ int main()
     renderpass_info.dependencyCount = (uint32_t)renderpass_deps.size();
     renderpass_info.pDependencies = renderpass_deps.data();
     vk::UniqueRenderPass renderpass = device->createRenderPassUnique(renderpass_info);
+    debug_name(renderpass, "GEO RenderPass");
 
     // Create Pipeline
 
@@ -759,6 +1155,7 @@ int main()
     pipeline_info.subpass = 0;
 
     vk::UniquePipeline pipeline = device->createGraphicsPipelineUnique(nullptr, pipeline_info);
+    debug_name(pipeline, "GEO Pipeline");
 
     // Create Composite Pipeline
 
@@ -789,7 +1186,7 @@ int main()
     pipeline_info.subpass = 1;
 
     vk::UniquePipeline pipeline_comp = device->createGraphicsPipelineUnique(nullptr, pipeline_info);
-
+    debug_name(pipeline_comp, "COMP Pipeline");
 
     // Create clear screen command
 
@@ -803,6 +1200,7 @@ int main()
     std::vector<vk::CommandBuffer> submit_commands(swapchain_images.size());
     for (int i = 0; i < swapchain_images.size(); i++)
     {
+        debug_name(cmd_draw[i], fmt::format("Draw Command#{}", i));
         cmd_draw[i]->begin({ vk::CommandBufferUsageFlags() });
         {
             vk::ImageMemoryBarrier barrier;
@@ -829,7 +1227,7 @@ int main()
             blit_region.dstSubresource = vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1);
             blit_region.dstOffsets[0] = vk::Offset3D(0, 0, 0);
             blit_region.dstOffsets[1] = vk::Offset3D(surface_caps.currentExtent.width, surface_caps.currentExtent.height, 1);
-            cmd_draw[i]->blitImage(*image, vk::ImageLayout::eTransferSrcOptimal,
+            cmd_draw[i]->blitImage(*rt_output, vk::ImageLayout::eGeneral,
                 swapchain_images[i], vk::ImageLayout::eTransferDstOptimal, blit_region, vk::Filter::eLinear);
 
             barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -864,6 +1262,7 @@ int main()
             framebuffer_info.height = surface_caps.currentExtent.height;
             framebuffer_info.layers = 1;
             framebuffers[i] = device->createFramebufferUnique(framebuffer_info);
+            debug_name(framebuffers[i], fmt::format("Framebuffer#{}", i));
 
             std::array<vk::ClearValue, 5> clear_values{
                 vk::ClearValue(),                                         // color (not cleared)
@@ -876,9 +1275,10 @@ int main()
             renderpass_begin_info.renderPass = *renderpass;
             renderpass_begin_info.framebuffer = *framebuffers[i];
             renderpass_begin_info.renderArea.extent = surface_caps.currentExtent;
-            renderpass_begin_info.renderArea.offset = {};
+            renderpass_begin_info.renderArea.offset = vk::Offset2D{};
             renderpass_begin_info.clearValueCount = (uint32_t)clear_values.size();
             renderpass_begin_info.pClearValues = clear_values.data();
+            /*
             cmd_draw[i]->beginRenderPass(renderpass_begin_info, vk::SubpassContents::eInline);
             {
                 cmd_draw[i]->bindVertexBuffers(0, *triangle_buffer, { 0 });
@@ -898,12 +1298,12 @@ int main()
             cmd_draw[i]->nextSubpass(vk::SubpassContents::eInline);
             {
                 cmd_draw[i]->bindDescriptorSets(vk::PipelineBindPoint::eGraphics, 
-                    *pipeline_comp_layout, 0, descr_sets_comp[0].get(), nullptr);
+                    *pipeline_comp_layout, 0, descr_sets_comp.get(), nullptr);
                 cmd_draw[i]->bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline_comp);
                 cmd_draw[i]->draw(6, 1, 0, 0);
             }
             cmd_draw[i]->endRenderPass();
-
+            */
             //vk::ClearColorValue clear_color = std::array<float, 4>({ 1, 0, 1, 1 });
             //cmd_clear[i]->clearColorImage(swapchain_images[i], vk::ImageLayout::eTransferDstOptimal, 
             //    clear_color, barrier.subresourceRange);
@@ -911,13 +1311,6 @@ int main()
         cmd_draw[i]->end();
         submit_commands[i] = *cmd_draw[i];
     }
-
-    vk::UniqueFence submit_fence = device->createFenceUnique({});
-    vk::SubmitInfo submit_info;
-    submit_info.commandBufferCount = 2;
-    submit_info.pCommandBuffers = submit_commands.data();
-    q.submit(submit_info, *submit_fence);
-    q.waitIdle();
 
     MSG msg;
     while (running)
@@ -932,26 +1325,48 @@ int main()
             break;
 
         vk::UniqueSemaphore backbuffer_semaphore = device->createSemaphoreUnique({});
+        debug_name(backbuffer_semaphore, "backbuffer_semaphore");
         auto backbuffer = device->acquireNextImageKHR(*swapchain, UINT64_MAX, *backbuffer_semaphore, nullptr);
         if (backbuffer.result == vk::Result::eSuccess)
         {
             static float angle = 0.f;
             angle += glm::radians(1.f);
-            if (uniform_buffers_t* uniforms_ptr = reinterpret_cast<uniform_buffers_t*>(device->mapMemory(*uniform_mem, 0, VK_WHOLE_SIZE)))
+            glm::vec3 cam_pos = glm::vec3(glm::cos(angle * 0.1f), 0.5f, glm::sin(angle * 0.1f)) * 3.f;
+            glm::vec3 light_pos = glm::vec3(glm::cos(angle), 0.3f, glm::sin(angle)) * 5.f;
+            float aspect = (float)surface_caps.currentExtent.width / (float)surface_caps.currentExtent.height;
+            if (auto ptr = reinterpret_cast<uniform_buffers_t*>(device->mapMemory(*uniform_mem, 0, VK_WHOLE_SIZE)))
             {
-                float aspect = (float)surface_caps.currentExtent.width / (float)surface_caps.currentExtent.height;
                 for (const auto& n : nodes)
                 {
-                    uniforms_ptr->proj = glm::perspective(glm::radians(85.f), aspect, .1f, 100.f);
-                    uniforms_ptr->view = glm::lookAt(glm::vec3(0, -2, 5), glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
-                    uniforms_ptr->model = glm::scale(glm::vec3(.05f)) * glm::eulerAngleY(angle) * n.mat;
-                    uniforms_ptr->col = glm::vec4(n.col, 1.f);
-                    uniforms_ptr++;
+                    ptr->proj = glm::perspective(glm::radians(85.f), aspect, .1f, 100.f);
+                    ptr->view = glm::lookAt(cam_pos, glm::vec3(0, 0, 0), glm::vec3(0, -1, 0));
+                    ptr->model = n.mat;
+                    ptr->col = glm::vec4(n.col, 1.f);
+                    ptr++;
                 }
                 device->unmapMemory(*uniform_mem);
             }
+            if (auto ptr = reinterpret_cast<uniform_buffers_comp_t*>(device->mapMemory(*uniform_comp_mem, 0, VK_WHOLE_SIZE)))
+            {
+                ptr->camera = { cam_pos, 1.f };
+                ptr->light_pos = { light_pos, 1.f };
+                device->unmapMemory(*uniform_comp_mem);
+            }
+            if (auto ptr = reinterpret_cast<uniform_rt_buffers_t*>(device->mapMemory(*uniform_rt_mem, 0, VK_WHOLE_SIZE)))
+            {
+                ptr->proj_inverse = glm::inverse(glm::perspective(glm::radians(85.f), aspect, .1f, 100.f));
+                ptr->view_inverse = glm::inverse(glm::lookAt(cam_pos, glm::vec3(0, 0, 0), glm::vec3(0, -1, 0)));
+                ptr->color = glm::vec4(glm::sin(angle * 5.f), 0, 0, 1);
+                device->unmapMemory(*uniform_rt_mem);
+            }
 
+            vk::SubmitInfo cmd_trace_submit;
+            cmd_trace_submit.commandBufferCount = 1;
+            cmd_trace_submit.pCommandBuffers = &cmd_trace.get();
+            q.submit(cmd_trace_submit, nullptr);
+            
             vk::UniqueSemaphore render_sem = device->createSemaphoreUnique({});
+            debug_name(render_sem, "render_sem");
             std::array<vk::PipelineStageFlags, 1> wait_stages{ vk::PipelineStageFlagBits::eColorAttachmentOutput };
             vk::SubmitInfo submit_info;
             submit_info.signalSemaphoreCount = 1;
@@ -974,5 +1389,21 @@ int main()
         }
     }
 
-    exit(0);
+    //debug_messenger.reset();
+    exit(EXIT_SUCCESS);
+}
+
+int main()
+{
+    try
+    {
+        main_run();
+    }
+    catch (vk::DeviceLostError* e)
+    {
+//         device.reset();
+//         instance.reset();
+        std::cout << "DEVICE LOST: " << e->what() << std::endl;
+        abort();
+    }
 }

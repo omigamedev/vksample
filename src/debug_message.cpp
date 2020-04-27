@@ -1,48 +1,6 @@
 #include "pch.h"
 #include <sstream>
 
-PFN_vkDebugMarkerSetObjectNameEXT pfnvkDebugMarkerSetObjectNameEXT = nullptr;
-PFN_vkCmdDebugMarkerBeginEXT pfnvkCmdDebugMarkerBeginEXT = nullptr;
-PFN_vkCmdDebugMarkerInsertEXT pfnvkCmdDebugMarkerInsertEXT = nullptr;
-PFN_vkCmdDebugMarkerEndEXT pfnvkCmdDebugMarkerEndEXT = nullptr;
-
-VKAPI_ATTR VkResult VKAPI_CALL vkDebugMarkerSetObjectNameEXT(VkDevice device, const VkDebugMarkerObjectNameInfoEXT* pNameInfo)
-{
-    return pfnvkDebugMarkerSetObjectNameEXT ? pfnvkDebugMarkerSetObjectNameEXT(device, pNameInfo) : VkResult::VK_SUCCESS;
-}
-
-VKAPI_ATTR void VKAPI_CALL vkCmdDebugMarkerBeginEXT(VkCommandBuffer commandBuffer, const VkDebugMarkerMarkerInfoEXT* pMarkerInfo)
-{
-    if (pfnvkCmdDebugMarkerBeginEXT)
-        pfnvkCmdDebugMarkerBeginEXT(commandBuffer, pMarkerInfo);
-}
-
-VKAPI_ATTR void VKAPI_CALL vkCmdDebugMarkerInsertEXT(VkCommandBuffer commandBuffer, const VkDebugMarkerMarkerInfoEXT* pMarkerInfo)
-{
-    if (pfnvkCmdDebugMarkerInsertEXT)
-        pfnvkCmdDebugMarkerInsertEXT(commandBuffer, pMarkerInfo);
-}
-
-VKAPI_ATTR void VKAPI_CALL vkCmdDebugMarkerEndEXT(VkCommandBuffer commandBuffer)
-{
-    if (pfnvkCmdDebugMarkerEndEXT)
-        pfnvkCmdDebugMarkerEndEXT(commandBuffer);
-}
-
-PFN_vkCreateDebugUtilsMessengerEXT pfnVkCreateDebugUtilsMessengerEXT;
-PFN_vkDestroyDebugUtilsMessengerEXT pfnVkDestroyDebugUtilsMessengerEXT;
-
-VKAPI_ATTR VkResult VKAPI_CALL vkCreateDebugUtilsMessengerEXT(VkInstance instance, const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDebugUtilsMessengerEXT* pMessenger)
-{
-    return pfnVkCreateDebugUtilsMessengerEXT(instance, pCreateInfo, pAllocator, pMessenger);
-}
-
-VKAPI_ATTR void VKAPI_CALL vkDestroyDebugUtilsMessengerEXT(VkInstance instance, VkDebugUtilsMessengerEXT messenger, VkAllocationCallbacks const* pAllocator)
-{
-    return pfnVkDestroyDebugUtilsMessengerEXT(instance, messenger, pAllocator);
-}
-
-
 VkBool32 debugMessageFunc(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageTypes,
     VkDebugUtilsMessengerCallbackDataEXT const* pCallbackData, void* /*pUserData*/)
 {
@@ -50,9 +8,11 @@ VkBool32 debugMessageFunc(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity
 
     message << vk::to_string(static_cast<vk::DebugUtilsMessageSeverityFlagBitsEXT>(messageSeverity)) << 
         ": " << vk::to_string(static_cast<vk::DebugUtilsMessageTypeFlagsEXT>(messageTypes)) << ":\n";
-    message << "\t" << "messageIDName   = <" << pCallbackData->pMessageIdName << ">\n";
+    if (pCallbackData->pMessageIdName)
+        message << "\t" << "messageIDName   = <" << pCallbackData->pMessageIdName << ">\n";
     message << "\t" << "messageIdNumber = " << pCallbackData->messageIdNumber << "\n";
-    message << "\t" << "message         = <" << pCallbackData->pMessage << ">\n";
+    if (pCallbackData->pMessage)
+        message << "\t" << "message         = <" << pCallbackData->pMessage << ">\n";
     if (0 < pCallbackData->queueLabelCount)
     {
         message << "\t" << "Queue Labels:\n";
@@ -94,30 +54,11 @@ VkBool32 debugMessageFunc(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity
     return false;
 }
 
-void init_debug_message(const vk::UniqueInstance& inst)
+vk::UniqueDebugUtilsMessengerEXT init_debug_message(const vk::UniqueInstance& inst)
 {
-    pfnvkDebugMarkerSetObjectNameEXT = reinterpret_cast<PFN_vkDebugMarkerSetObjectNameEXT>(inst->getProcAddr("vkDebugMarkerSetObjectNameEXT"));
-    pfnvkCmdDebugMarkerBeginEXT = reinterpret_cast<PFN_vkCmdDebugMarkerBeginEXT>(inst->getProcAddr("vkCmdDebugMarkerBeginEXT"));
-    pfnvkCmdDebugMarkerInsertEXT = reinterpret_cast<PFN_vkCmdDebugMarkerInsertEXT>(inst->getProcAddr("vkCmdDebugMarkerInsertEXT"));
-    pfnvkCmdDebugMarkerEndEXT = reinterpret_cast<PFN_vkCmdDebugMarkerEndEXT>(inst->getProcAddr("vkCmdDebugMarkerEndEXT"));
-
-    pfnVkCreateDebugUtilsMessengerEXT = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(inst->getProcAddr("vkCreateDebugUtilsMessengerEXT"));
-    if (!pfnVkCreateDebugUtilsMessengerEXT)
-    {
-        std::cout << "GetInstanceProcAddr: Unable to find pfnVkCreateDebugUtilsMessengerEXT function." << std::endl;
-        exit(1);
-    }
-
-    pfnVkDestroyDebugUtilsMessengerEXT = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(inst->getProcAddr("vkDestroyDebugUtilsMessengerEXT"));
-    if (!pfnVkDestroyDebugUtilsMessengerEXT)
-    {
-        std::cout << "GetInstanceProcAddr: Unable to find pfnVkDestroyDebugUtilsMessengerEXT function." << std::endl;
-        exit(1);
-    }
-
     vk::DebugUtilsMessageSeverityFlagsEXT severityFlags(
-        vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo
-        | vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose
+        //vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
+        vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose
         | vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning
         | vk::DebugUtilsMessageSeverityFlagBitsEXT::eError
     );
@@ -127,5 +68,5 @@ void init_debug_message(const vk::UniqueInstance& inst)
         | vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation
     );
     auto debug_info = vk::DebugUtilsMessengerCreateInfoEXT({}, severityFlags, messageTypeFlags, &debugMessageFunc);
-    auto debug = inst->createDebugUtilsMessengerEXTUnique(debug_info);
+    return inst->createDebugUtilsMessengerEXTUnique(debug_info);
 }

@@ -1,6 +1,7 @@
 #pragma once
+#include <vulkan/vulkan_core.h>
 
-void init_debug_message(const vk::UniqueInstance& inst);
+vk::UniqueDebugUtilsMessengerEXT init_debug_message(const vk::UniqueInstance& inst);
 
 constexpr vk::DebugReportObjectTypeEXT type2report(vk::ObjectType type)
 {
@@ -74,10 +75,10 @@ constexpr vk::DebugReportObjectTypeEXT type2report(vk::ObjectType type)
         return vk::DebugReportObjectTypeEXT::eDisplayModeKHR;
     case vk::ObjectType::eDebugReportCallbackEXT:
         return vk::DebugReportObjectTypeEXT::eDebugReportCallbackEXT;
-    case vk::ObjectType::eObjectTableNVX:
-        return vk::DebugReportObjectTypeEXT::eObjectTableNVX;
-    case vk::ObjectType::eIndirectCommandsLayoutNVX:
-        return vk::DebugReportObjectTypeEXT::eIndirectCommandsLayoutNVX;
+    //case vk::ObjectType::eObjectTableNVX:
+    //    return vk::DebugReportObjectTypeEXT::eObjectTableNVX;
+    //case vk::ObjectType::eIndirectCommandsLayoutNVX:
+    //    return vk::DebugReportObjectTypeEXT::eIndirectCommandsLayoutNVX;
     case vk::ObjectType::eDebugUtilsMessengerEXT:
         break;
     case vk::ObjectType::eValidationCacheEXT:
@@ -93,23 +94,69 @@ constexpr vk::DebugReportObjectTypeEXT type2report(vk::ObjectType type)
 }
 
 template<typename T>
-void debug_name(const vk::UniqueDevice& dev, T obj, const char* name)
+void debug_name(const vk::UniqueDevice& dev, T obj, const std::string& name)
 {
     using _VkType = typename T::CType;
-    vk::DebugMarkerObjectNameInfoEXT dbg_info;
-    dbg_info.object = (uint64_t)((_VkType)obj);
-    dbg_info.objectType = type2report(obj.objectType);
-    dbg_info.pObjectName = name;
-    dev->debugMarkerSetObjectNameEXT(dbg_info);
+    if (VULKAN_HPP_DEFAULT_DISPATCHER.vkDebugMarkerSetObjectNameEXT)
+    {
+        vk::DebugMarkerObjectNameInfoEXT dbg_info;
+        dbg_info.object = (uint64_t)((_VkType)obj);
+        dbg_info.objectType = type2report(obj.objectType);
+        dbg_info.pObjectName = name.c_str();
+        dev->debugMarkerSetObjectNameEXT(dbg_info);
+    }
+    else if (VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT)
+    {
+        vk::DebugUtilsObjectNameInfoEXT dbg_info;
+        dbg_info.objectHandle = (uint64_t)((_VkType)obj);
+        dbg_info.objectType   = obj.objectType;
+        dbg_info.pObjectName  = name.c_str();
+        dev->setDebugUtilsObjectNameEXT(dbg_info);
+    }
 }
 
 template<class T>
-void debug_name(const vk::UniqueHandle<T, VULKAN_HPP_DEFAULT_DISPATCHER_TYPE>& obj, const char* name)
+void debug_name(const vk::UniqueHandle<T, VULKAN_HPP_DEFAULT_DISPATCHER_TYPE>& obj, const std::string& name)
 {
     using _VkType = typename T::CType;
-    VkDebugMarkerObjectNameInfoEXT dbg_info{ VK_STRUCTURE_TYPE_DEBUG_MARKER_OBJECT_NAME_INFO_EXT };
-    dbg_info.object = (uint64_t)((_VkType)*obj);
-    dbg_info.objectType = (VkDebugReportObjectTypeEXT)type2report(obj->objectType);
-    dbg_info.pObjectName = name;
-    vkDebugMarkerSetObjectNameEXT(obj.getOwner(), &dbg_info);
+    if (VULKAN_HPP_DEFAULT_DISPATCHER.vkDebugMarkerSetObjectNameEXT)
+    {
+        VkDebugMarkerObjectNameInfoEXT dbg_info{ VK_STRUCTURE_TYPE_DEBUG_MARKER_OBJECT_NAME_INFO_EXT };
+        dbg_info.object = (uint64_t)((_VkType)*obj);
+        dbg_info.objectType = (VkDebugReportObjectTypeEXT)type2report(obj->objectType);
+        dbg_info.pObjectName = name.c_str();
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkDebugMarkerSetObjectNameEXT(obj.getOwner(), &dbg_info);
+    }
+    else if (VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT)
+    {
+        VkDebugUtilsObjectNameInfoEXT dbg_info{ VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT };
+        dbg_info.objectHandle = (uint64_t)((_VkType)*obj);
+        dbg_info.objectType = (VkObjectType)obj->objectType;
+        dbg_info.pObjectName = name.c_str();
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT(obj.getOwner(), &dbg_info);
+    }
+}
+
+void debug_mark_begin(const vk::UniqueCommandBuffer& cmd, const std::string& name)
+{
+    if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdDebugMarkerBeginEXT)
+        cmd->debugMarkerBeginEXT({ name.c_str() });
+    else if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBeginDebugUtilsLabelEXT)
+        cmd->beginDebugUtilsLabelEXT({ name.c_str() });
+}
+
+void debug_mark_end(const vk::UniqueCommandBuffer& cmd)
+{
+    if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdDebugMarkerEndEXT)
+        cmd->debugMarkerEndEXT();
+    else if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdEndDebugUtilsLabelEXT)
+        cmd->endDebugUtilsLabelEXT();
+}
+
+void debug_mark_insert(const vk::UniqueCommandBuffer& cmd, const std::string& name)
+{
+    if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdDebugMarkerInsertEXT)
+        cmd->debugMarkerInsertEXT({ name.c_str() });
+    else if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdInsertDebugUtilsLabelEXT)
+        cmd->insertDebugUtilsLabelEXT({ name.c_str() });
 }

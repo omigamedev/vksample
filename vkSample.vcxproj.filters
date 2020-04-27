@@ -18,7 +18,7 @@
     </Filter>
     <Filter Include="Shaders">
       <UniqueIdentifier>{77e9a041-6124-41ec-b8a0-9d1678f689d2}</UniqueIdentifier>
-      <Extensions>vert;frag</Extensions>
+      <Extensions>vert;frag;rchit;rgen;rmiss;glsl</Extensions>
     </Filter>
     <Filter Include="Libs\fmt">
       <UniqueIdentifier>{97957435-7882-43a5-b77d-1e558649d610}</UniqueIdentifier>
@@ -56,38 +56,6 @@
     <ClInclude Include="src\debug_message.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-  </ItemGroup>
-  <ItemGroup>
-    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
-      <Filter>Shaders</Filter>
-    </CustomBuild>
-    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
-      <Filter>Shaders</Filter>
-    </CustomBuild>
-    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
-      <Filter>Shaders</Filter>
-    </CustomBuild>
-    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
-      <Filter>Shaders</Filter>
-    </CustomBuild>
-    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
-      <Filter>Shaders</Filter>
-    </CustomBuild>
-    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
-      <Filter>Shaders</Filter>
-    </CustomBuild>
-    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
-      <Filter>Shaders</Filter>
-    </CustomBuild>
-    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
-      <Filter>Shaders</Filter>
-    </CustomBuild>
-    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
-      <Filter>Shaders</Filter>
-    </CustomBuild>
-    <CustomBuild Include="shaders\*.frag;shaders\*.vert">
-      <Filter>Shaders</Filter>
-    </CustomBuild>
   </ItemGroup>
   <ItemGroup>
     <CopyFileToFolders Include="libs\assimp\out\install\x64-Release\bin\assimp-vc142-mt.dll">
