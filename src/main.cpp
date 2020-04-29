@@ -99,19 +99,23 @@ void find_device()
                 queue_info.queueFamilyIndex = family_index;
                 queue_info.queueCount = 1;
                 queue_info.pQueuePriorities = queue_priorities.data();
-                vk::PhysicalDeviceFeatures device_features;
-                vk::PhysicalDeviceVulkan12Features  device_features12;
-                device_features12.bufferDeviceAddress = true;
-                vk::DeviceCreateInfo device_info;
-                device_info.queueCreateInfoCount = 1;
-                device_info.pQueueCreateInfos = &queue_info;
-                device_info.enabledLayerCount = (uint32_t)device_layers.size();
-                device_info.ppEnabledLayerNames = device_layers.data();
-                device_info.enabledExtensionCount = (uint32_t)device_extensions.size();
-                device_info.ppEnabledExtensionNames = device_extensions.data();
-                device_info.pEnabledFeatures = &device_features;
-                device = pd.createDeviceUnique(vk::StructureChain(device_info, device_features12)
-                    .get<vk::DeviceCreateInfo>());
+                vk::StructureChain device_info {
+                    vk::DeviceCreateInfo()
+                        .setQueueCreateInfoCount(1)
+                        .setPQueueCreateInfos(&queue_info)
+                        .setEnabledLayerCount((uint32_t)device_layers.size())
+                        .setPpEnabledLayerNames(device_layers.data())
+                        .setEnabledExtensionCount((uint32_t)device_extensions.size())
+                        .setPpEnabledExtensionNames(device_extensions.data()),
+                    vk::StructureChain{
+                        vk::PhysicalDeviceFeatures2(),
+                        vk::PhysicalDeviceVulkan12Features()
+                            .setBufferDeviceAddress(true),
+                        vk::PhysicalDeviceRayTracingFeaturesKHR()
+                            .setRayTracing(true),
+                    }.get<vk::PhysicalDeviceFeatures2>(),
+                };
+                device = pd.createDeviceUnique(device_info.get<vk::DeviceCreateInfo>());
                 physical_device = pd;
                 device_family = family_index;
                 return;
