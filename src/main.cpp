@@ -40,8 +40,13 @@ struct uniform_rt_buffers_t
     glm::mat4 view_inverse;
     glm::mat4 proj_inverse;
     glm::vec4 color;
-    static constexpr uint32_t mvp_size = sizeof(view_inverse) + sizeof(proj_inverse);
-    uint8_t pad2[0x100 - mvp_size & ~0x100]; // alignment
+    static constexpr uint32_t rgen_size = sizeof(view_inverse) + sizeof(proj_inverse);
+    uint8_t pad1[0x100 - rgen_size & ~0x100]; // alignment
+
+    glm::vec4 light_pos;
+    static constexpr uint32_t rhit_size = sizeof(light_pos);
+    static constexpr uint32_t rhit_offset = rgen_size + sizeof(pad1);
+    uint8_t pad2[0x100 - rgen_size & ~0x100]; // alignment
 };
 
 LRESULT WINAPI main_window_proc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -78,7 +83,11 @@ void find_device()
                 };
                 std::vector<const char*> device_extensions{
                     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-                    VK_NV_RAY_TRACING_EXTENSION_NAME,
+                    VK_KHR_RAY_TRACING_EXTENSION_NAME,
+                    VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
+                    VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+                    VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+                    VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,
                 };
                 // Add debug names extension which is available only when it's profiled
                 for (auto ext : pd.enumerateDeviceExtensionProperties())
@@ -91,6 +100,8 @@ void find_device()
                 queue_info.queueCount = 1;
                 queue_info.pQueuePriorities = queue_priorities.data();
                 vk::PhysicalDeviceFeatures device_features;
+                vk::PhysicalDeviceVulkan12Features  device_features12;
+                device_features12.bufferDeviceAddress = true;
                 vk::DeviceCreateInfo device_info;
                 device_info.queueCreateInfoCount = 1;
                 device_info.pQueueCreateInfos = &queue_info;
@@ -99,7 +110,8 @@ void find_device()
                 device_info.enabledExtensionCount = (uint32_t)device_extensions.size();
                 device_info.ppEnabledExtensionNames = device_extensions.data();
                 device_info.pEnabledFeatures = &device_features;
-                device = pd.createDeviceUnique(device_info);
+                device = pd.createDeviceUnique(vk::StructureChain(device_info, device_features12)
+                    .get<vk::DeviceCreateInfo>());
                 physical_device = pd;
                 device_family = family_index;
                 return;
@@ -215,11 +227,10 @@ void change_layout(const vk::UniqueImage& image, vk::ImageLayout src, vk::ImageL
     }
     cmd->end();
 
-    vk::UniqueFence submit_fence = device->createFenceUnique({});
     vk::SubmitInfo submit_info;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &cmd.get();
-    q.submit(submit_info, *submit_fence);
+    q.submit(submit_info, nullptr);
     q.waitIdle();
 }
 
@@ -256,8 +267,7 @@ int main_run()
     instance_app_info.pEngineName = "Custom";
     instance_app_info.engineVersion = VK_MAKE_VERSION(0, 1, 0);
     instance_app_info.apiVersion = VK_VERSION_1_2;
-    std::array<const char*, 2> instance_layers {
-        "VK_LAYER_LUNARG_standard_validation",
+    std::array<const char*, 1> instance_layers {
         "VK_LAYER_KHRONOS_validation",
         //"VK_LAYER_RENDERDOC_Capture",
     };
@@ -278,7 +288,7 @@ int main_run()
 
     // Debugging
     
-    //auto debug_messenger = init_debug_message(instance);
+    auto debug_messenger = init_debug_message(instance);
 
     // Window/Surface creation
 
@@ -356,13 +366,15 @@ int main_run()
     {
         uint32_t id;
         uint32_t vtx_offset;
+        uint32_t vtx_count;
         uint32_t idx_offset;
         uint32_t idx_count;
+        vk::DeviceAddress blas_addr;
         vk::DeviceSize blas_offset;
         vk::DeviceSize blas_size;
-        uint64_t blas_handle;
-        vk::UniqueAccelerationStructureNV blas;
-        vk::GeometryNV g;
+        vk::UniqueAccelerationStructureKHR blas;
+        vk::AccelerationStructureBuildGeometryInfoKHR build_geo;
+        vk::AccelerationStructureBuildOffsetInfoKHR build_offset;
     };
 
     struct node_t
@@ -386,6 +398,7 @@ int main_run()
         mesh.idx_offset = (uint32_t)mesh_data_idx.size();
         mesh.idx_count = scene_mesh->mNumFaces * 3;
         mesh.vtx_offset = (uint32_t)mesh_data_vert.size();
+        mesh.vtx_count = (uint32_t)scene_mesh->mNumVertices;
         for (uint32_t vertex_index = 0; vertex_index < scene_mesh->mNumVertices; vertex_index++)
         {
             glm::vec3 pos = glm::make_vec3(&scene_mesh->mVertices[vertex_index].x);
@@ -418,12 +431,16 @@ int main_run()
     // vertex buffer
     vk::BufferCreateInfo triangle_buffer_info;
     triangle_buffer_info.size = mesh_data_vert.size() * sizeof(vertex_t);
-    triangle_buffer_info.usage = vk::BufferUsageFlagBits::eVertexBuffer;
+    triangle_buffer_info.usage = vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
     vk::UniqueBuffer triangle_buffer = device->createBufferUnique(triangle_buffer_info);
     vk::MemoryRequirements triangle_buffer_mem_req = device->getBufferMemoryRequirements(*triangle_buffer);
     uint32_t triangle_buffer_mem_idx = find_memory(triangle_buffer_mem_req,
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-    vk::UniqueDeviceMemory triangle_buffer_mem = device->allocateMemoryUnique({ triangle_buffer_mem_req.size, triangle_buffer_mem_idx });
+    vk::StructureChain triangle_buffer_mem_info{
+        vk::MemoryAllocateInfo(triangle_buffer_mem_req.size, triangle_buffer_mem_idx),
+        vk::MemoryAllocateFlagsInfo(vk::MemoryAllocateFlagBits::eDeviceAddress) };
+    vk::UniqueDeviceMemory triangle_buffer_mem = device->allocateMemoryUnique(
+        triangle_buffer_mem_info.get<vk::MemoryAllocateInfo>());
     device->bindBufferMemory(*triangle_buffer, *triangle_buffer_mem, 0);
     if (auto* ptr = reinterpret_cast<vertex_t*>(device->mapMemory(*triangle_buffer_mem, 0, VK_WHOLE_SIZE)))
     {
@@ -434,12 +451,16 @@ int main_run()
     // index buffer
     vk::BufferCreateInfo triangle_buffer_idx_info;
     triangle_buffer_idx_info.size = mesh_data_idx.size() * sizeof(uint32_t);
-    triangle_buffer_idx_info.usage = vk::BufferUsageFlagBits::eIndexBuffer;
+    triangle_buffer_idx_info.usage = vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
     vk::UniqueBuffer triangle_buffer_idx = device->createBufferUnique(triangle_buffer_idx_info);
     vk::MemoryRequirements triangle_buffer_idx_mem_req = device->getBufferMemoryRequirements(*triangle_buffer_idx);
     uint32_t triangle_buffer_idx_mem_idx = find_memory(triangle_buffer_idx_mem_req,
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-    vk::UniqueDeviceMemory triangle_buffer_idx_mem = device->allocateMemoryUnique({ triangle_buffer_idx_mem_req.size, triangle_buffer_idx_mem_idx });
+    vk::StructureChain triangle_buffer_idx_mem_info{
+        vk::MemoryAllocateInfo(triangle_buffer_idx_mem_req.size, triangle_buffer_idx_mem_idx),
+        vk::MemoryAllocateFlagsInfo(vk::MemoryAllocateFlagBits::eDeviceAddress) };
+    vk::UniqueDeviceMemory triangle_buffer_idx_mem = device->allocateMemoryUnique(
+        triangle_buffer_mem_info.get<vk::MemoryAllocateInfo>());
     device->bindBufferMemory(*triangle_buffer_idx, *triangle_buffer_idx_mem, 0);
     if (auto* ptr = reinterpret_cast<uint32_t*>(device->mapMemory(*triangle_buffer_idx_mem, 0, VK_WHOLE_SIZE)))
     {
@@ -454,7 +475,7 @@ int main_run()
     std::array<vk::DescriptorPoolSize, 4> descrpool_sizes{
         vk::DescriptorPoolSize{ vk::DescriptorType::eUniformBuffer, (uint32_t)nodes.size() * 3 },
         vk::DescriptorPoolSize{ vk::DescriptorType::eInputAttachment, 4 },
-        vk::DescriptorPoolSize{ vk::DescriptorType::eAccelerationStructureNV, 1 },
+        vk::DescriptorPoolSize{ vk::DescriptorType::eAccelerationStructureKHR, 1 },
         vk::DescriptorPoolSize{ vk::DescriptorType::eStorageImage, 1 },
     };
     uint32_t pool_size =
@@ -469,8 +490,8 @@ int main_run()
 
     // Create RT objects
 
-    auto rt_props = physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceRayTracingPropertiesNV>()
-        .get<vk::PhysicalDeviceRayTracingPropertiesNV>();
+    auto rt_props = physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceRayTracingPropertiesKHR>()
+        .get<vk::PhysicalDeviceRayTracingPropertiesKHR>();
     
     // BLAS
     vk::DeviceSize blas_mem_size = 0;
@@ -478,35 +499,55 @@ int main_run()
     vk::MemoryRequirements2 blas_mem_req;
     for (auto& m : meshes)
     {
-        m.g.geometryType = vk::GeometryTypeNV::eTriangles;
-        m.g.geometry.triangles.vertexData = *triangle_buffer;
-        m.g.geometry.triangles.vertexOffset = m.vtx_offset * sizeof(vertex_t);
-        m.g.geometry.triangles.vertexCount = m.idx_count * 3;
-        m.g.geometry.triangles.vertexStride = sizeof(vertex_t);
-        m.g.geometry.triangles.vertexFormat = vk::Format::eR32G32B32Sfloat;
-        m.g.geometry.triangles.indexData = *triangle_buffer_idx;
-        m.g.geometry.triangles.indexOffset = m.idx_offset * sizeof(uint32_t);
-        m.g.geometry.triangles.indexCount = m.idx_count;
-        m.g.geometry.triangles.indexType = vk::IndexType::eUint32;
-        m.g.flags = vk::GeometryFlagBitsNV::eOpaque;
+        vk::AccelerationStructureCreateGeometryTypeInfoKHR geo_info;
+        geo_info.geometryType = vk::GeometryTypeKHR::eTriangles;
+        geo_info.maxPrimitiveCount = m.idx_count / 3;
+        geo_info.indexType = vk::IndexType::eUint32;
+        geo_info.maxVertexCount = m.vtx_count;
+        geo_info.vertexFormat = vk::Format::eR32G32B32Sfloat;
+        geo_info.allowsTransforms = false;
 
-        vk::AccelerationStructureCreateInfoNV blas_info;
-        blas_info.info.type = vk::AccelerationStructureTypeNV::eBottomLevel;
-        blas_info.info.instanceCount = 0;
-        blas_info.info.geometryCount = 1;
-        blas_info.info.pGeometries = &m.g;
-        m.blas = device->createAccelerationStructureNVUnique(blas_info);
+        vk::AccelerationStructureGeometryKHR geo;
+        geo.flags = vk::GeometryFlagBitsKHR::eOpaque;
+        geo.geometryType = vk::GeometryTypeKHR::eTriangles;
+        geo.geometry.triangles.vertexFormat = geo_info.vertexFormat;
+        geo.geometry.triangles.vertexStride = sizeof(vertex_t);
+        geo.geometry.triangles.vertexData = device->getBufferAddressKHR({ *triangle_buffer });
+        geo.geometry.triangles.indexData = device->getBufferAddressKHR({ *triangle_buffer_idx });
+        geo.geometry.triangles.indexType = geo_info.indexType;
+
+        vk::AccelerationStructureCreateInfoKHR blas_info;
+        blas_info.type = vk::AccelerationStructureTypeKHR::eBottomLevel;
+        blas_info.flags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+        blas_info.maxGeometryCount = 1;
+        blas_info.pGeometryInfos = &geo_info;
+        m.blas = device->createAccelerationStructureKHRUnique(blas_info);
         debug_name(m.blas, fmt::format("BLAS mesh#{}", m.id));
 
-        blas_mem_req = device->getAccelerationStructureMemoryRequirementsNV({
-            vk::AccelerationStructureMemoryRequirementsTypeNV::eObject, *m.blas });
+        blas_mem_req = device->getAccelerationStructureMemoryRequirementsKHR({
+            vk::AccelerationStructureMemoryRequirementsTypeKHR::eObject, 
+            vk::AccelerationStructureBuildTypeKHR::eDevice, *m.blas });
         m.blas_offset = blas_mem_size;
         m.blas_size = blas_mem_req.memoryRequirements.size;
         blas_mem_size += m.blas_size;
 
-        vk::MemoryRequirements2 scratch_req = device->getAccelerationStructureMemoryRequirementsNV({
-            vk::AccelerationStructureMemoryRequirementsTypeNV::eBuildScratch, *m.blas });
+        vk::MemoryRequirements2 scratch_req = device->getAccelerationStructureMemoryRequirementsKHR({
+            vk::AccelerationStructureMemoryRequirementsTypeKHR::eBuildScratch, 
+            vk::AccelerationStructureBuildTypeKHR::eDevice, *m.blas });
         scratch_size = std::max(scratch_size, scratch_req.memoryRequirements.size);
+
+        const vk::AccelerationStructureGeometryKHR* pGeometry = &geo;
+        m.build_geo.type = vk::AccelerationStructureTypeKHR::eBottomLevel;
+        m.build_geo.flags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+        m.build_geo.update = false;
+        m.build_geo.dstAccelerationStructure = *m.blas;
+        m.build_geo.geometryArrayOfPointers = false;
+        m.build_geo.geometryCount = 1;
+        m.build_geo.ppGeometries = &pGeometry;
+
+        m.build_offset.primitiveCount = geo_info.maxPrimitiveCount;
+        m.build_offset.primitiveOffset = m.idx_offset * sizeof(uint32_t);
+        m.build_offset.firstVertex = m.vtx_offset;
     }
     
     uint32_t blas_mem_idx = find_memory(blas_mem_req.memoryRequirements, vk::MemoryPropertyFlagBits::eDeviceLocal);
@@ -515,13 +556,13 @@ int main_run()
 
     for (auto& m : meshes)
     {
-        device->bindAccelerationStructureMemoryNV({ { *m.blas, *blas_mem, m.blas_offset } });
-        device->getAccelerationStructureHandleNV<uint64_t>(*m.blas, m.blas_handle);
+        device->bindAccelerationStructureMemoryKHR({ { *m.blas, *blas_mem, m.blas_offset } });
+        m.blas_addr = device->getAccelerationStructureAddressKHR({ *m.blas });
     }
 
 
     // TLAS
-    std::vector<vk::AccelerationStructureInstanceNV> rt_instances;
+    std::vector<vk::AccelerationStructureInstanceKHR> rt_instances;
     for (const auto& n : nodes)
     {
         for (const auto& mesh_index : n.mesh_indices)
@@ -534,108 +575,155 @@ int main_run()
             inst.instanceCustomIndex = rt_instances.size() - 1;
             inst.mask = 0xFF;
             inst.instanceShaderBindingTableRecordOffset = 0;
-            inst.flags = (uint8_t)vk::GeometryInstanceFlagBitsNV::eTriangleCullDisable;
-            inst.accelerationStructureReference = meshes[mesh_index].blas_handle;
+            inst.flags = (uint8_t)vk::GeometryInstanceFlagBitsKHR::eTriangleCullDisable;
+            inst.accelerationStructureReference = meshes[mesh_index].blas_addr;
         }
     }
-    vk::AccelerationStructureCreateInfoNV tlas_info;
-    tlas_info.info.type = vk::AccelerationStructureTypeNV::eTopLevel;
-    tlas_info.info.instanceCount = (uint32_t)rt_instances.size();
-    vk::UniqueAccelerationStructureNV tlas = device->createAccelerationStructureNVUnique(tlas_info);
+
+    vk::AccelerationStructureCreateGeometryTypeInfoKHR tlas_geo_info;
+    tlas_geo_info.geometryType = vk::GeometryTypeKHR::eInstances;
+    tlas_geo_info.maxPrimitiveCount = (uint32_t)rt_instances.size();
+    tlas_geo_info.allowsTransforms = true;
+
+    vk::AccelerationStructureCreateInfoKHR tlas_info;
+    tlas_info.type = vk::AccelerationStructureTypeKHR::eTopLevel;
+    tlas_info.flags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+    tlas_info.maxGeometryCount = 1;
+    tlas_info.pGeometryInfos = &tlas_geo_info;
+    vk::UniqueAccelerationStructureKHR tlas = device->createAccelerationStructureKHRUnique(tlas_info);
     debug_name(tlas, "TLAS");
 
-    vk::MemoryRequirements2 tlas_mem_req = device->getAccelerationStructureMemoryRequirementsNV({
-        vk::AccelerationStructureMemoryRequirementsTypeNV::eObject, *tlas });
+    vk::MemoryRequirements2 tlas_mem_req = device->getAccelerationStructureMemoryRequirementsKHR({
+        vk::AccelerationStructureMemoryRequirementsTypeKHR::eObject,
+        vk::AccelerationStructureBuildTypeKHR::eDevice, *tlas });
     uint32_t tlas_mem_idx = find_memory(tlas_mem_req.memoryRequirements, vk::MemoryPropertyFlagBits::eDeviceLocal);
     vk::UniqueDeviceMemory tlas_mem = device->allocateMemoryUnique({ tlas_mem_req.memoryRequirements.size, tlas_mem_idx });
     debug_name(tlas_mem, "TLAS Memory");
-    device->bindAccelerationStructureMemoryNV({ {*tlas, *tlas_mem, 0} });
+    device->bindAccelerationStructureMemoryKHR({ {*tlas, *tlas_mem, 0} });
 
-    uint64_t tlas_handle{};
-    device->getAccelerationStructureHandleNV<uint64_t>(*tlas, tlas_handle);
+    vk::MemoryRequirements2 tlas_scratch_req = device->getAccelerationStructureMemoryRequirementsKHR({
+        vk::AccelerationStructureMemoryRequirementsTypeKHR::eBuildScratch,
+        vk::AccelerationStructureBuildTypeKHR::eDevice, *tlas });
+    scratch_size = std::max(scratch_size, tlas_scratch_req.memoryRequirements.size);
 
     // Scratch buffer
-    vk::MemoryRequirements2 tlas_scratch_req = device->getAccelerationStructureMemoryRequirementsNV({
-        vk::AccelerationStructureMemoryRequirementsTypeNV::eBuildScratch, *tlas });
-    uint32_t tlas_scratch_idx = find_memory(tlas_scratch_req.memoryRequirements, vk::MemoryPropertyFlagBits::eDeviceLocal);
-    scratch_size = std::max(scratch_size, tlas_scratch_req.memoryRequirements.size);
-    vk::UniqueDeviceMemory scratch_mem = device->allocateMemoryUnique({ scratch_size, tlas_scratch_idx });
-    debug_name(scratch_mem, "Scratch Buffer Memory");
-
     vk::BufferCreateInfo scratch_buffer_info;
     scratch_buffer_info.size = scratch_size;
-    scratch_buffer_info.usage = vk::BufferUsageFlagBits::eRayTracingNV;
+    scratch_buffer_info.usage = vk::BufferUsageFlagBits::eRayTracingKHR | vk::BufferUsageFlagBits::eShaderDeviceAddress;
     vk::UniqueBuffer scratch_buffer = device->createBufferUnique(scratch_buffer_info);
     debug_name(scratch_buffer, "Scratch Buffer");
+    vk::MemoryRequirements scratch_mem_req = device->getBufferMemoryRequirements(*scratch_buffer);
+    uint32_t scratch_mem_idx = find_memory(scratch_mem_req, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    vk::StructureChain scratch_mem_info{
+        vk::MemoryAllocateInfo(scratch_mem_req.size, scratch_mem_idx),
+        vk::MemoryAllocateFlagsInfo(vk::MemoryAllocateFlagBits::eDeviceAddress) };
+    vk::UniqueDeviceMemory scratch_mem = device->allocateMemoryUnique(
+        scratch_mem_info.get<vk::MemoryAllocateInfo>());
+    debug_name(scratch_mem, "Scratch Buffer Memory");
+
     device->bindBufferMemory(*scratch_buffer, *scratch_mem, 0);
+    vk::DeviceAddress scratch_addr = device->getBufferAddressKHR(*scratch_buffer);
 
     // Instance buffer
     vk::BufferCreateInfo instance_buffer_info;
-    instance_buffer_info.size = rt_instances.size() * sizeof(vk::AccelerationStructureInstanceNV);
-    instance_buffer_info.usage = vk::BufferUsageFlagBits::eRayTracingNV;
+    instance_buffer_info.size = rt_instances.size() * sizeof(vk::AccelerationStructureInstanceKHR);
+    instance_buffer_info.usage = vk::BufferUsageFlagBits::eRayTracingKHR | vk::BufferUsageFlagBits::eShaderDeviceAddress;
     vk::UniqueBuffer instance_buffer = device->createBufferUnique(instance_buffer_info);
     debug_name(instance_buffer, "Instance Buffer");
     vk::MemoryRequirements instance_buffer_mem_req = device->getBufferMemoryRequirements(*instance_buffer);
     uint32_t instance_buffer_mem_idx = find_memory(instance_buffer_mem_req,
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-    vk::UniqueDeviceMemory instance_buffer_mem = device->allocateMemoryUnique({ instance_buffer_mem_req.size, triangle_buffer_idx_mem_idx });
+    vk::StructureChain instance_buffer_mem_info{
+        vk::MemoryAllocateInfo(instance_buffer_mem_req.size, instance_buffer_mem_idx),
+        vk::MemoryAllocateFlagsInfo(vk::MemoryAllocateFlagBits::eDeviceAddress) };
+    vk::UniqueDeviceMemory instance_buffer_mem = device->allocateMemoryUnique(
+        instance_buffer_mem_info.get<vk::MemoryAllocateInfo>());
     debug_name(instance_buffer_mem, "Instance Buffer Memory");
     device->bindBufferMemory(*instance_buffer, *instance_buffer_mem, 0);
-    if (auto* ptr = reinterpret_cast<vk::AccelerationStructureInstanceNV*>(device->mapMemory(*instance_buffer_mem, 0, VK_WHOLE_SIZE)))
+    if (auto* ptr = reinterpret_cast<vk::AccelerationStructureInstanceKHR*>(device->mapMemory(*instance_buffer_mem, 0, VK_WHOLE_SIZE)))
     {
         std::copy(rt_instances.begin(), rt_instances.end(), ptr);
         device->unmapMemory(*instance_buffer_mem);
     }
 
-    // Build AS
+    vk::AccelerationStructureGeometryKHR tlas_geo;
+    tlas_geo.geometryType = vk::GeometryTypeKHR::eInstances;
+    tlas_geo.geometry.instances.arrayOfPointers = false;
+    tlas_geo.geometry.instances.data = device->getBufferAddressKHR(*instance_buffer);
 
-    vk::UniqueCommandBuffer cmd_builder = std::move(
-        device->allocateCommandBuffersUnique({ *cmdpool, vk::CommandBufferLevel::ePrimary, 1 })[0]);
-    debug_name(cmd_builder, "AS Build Command");
-    cmd_builder->begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
-    debug_mark_insert(cmd_builder, "Build BLAS");
-    for (const auto& m : meshes)
+    const vk::AccelerationStructureGeometryKHR* tlas_build_geo_pGeometry = &tlas_geo;
+    vk::AccelerationStructureBuildGeometryInfoKHR tlas_build_geo;
+    tlas_build_geo.type = vk::AccelerationStructureTypeKHR::eTopLevel;
+    tlas_build_geo.flags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+    tlas_build_geo.update = false;
+    tlas_build_geo.dstAccelerationStructure = *tlas;
+    tlas_build_geo.geometryArrayOfPointers = false;
+    tlas_build_geo.geometryCount = 1;
+    tlas_build_geo.ppGeometries = &tlas_build_geo_pGeometry;
+    tlas_build_geo.scratchData = scratch_addr;
+
+    vk::AccelerationStructureBuildOffsetInfoKHR tlas_build_offset;
+    tlas_build_offset.primitiveCount = (uint32_t)rt_instances.size();
+    
+    // Build BLAS
+    for (auto& m : meshes)
     {
+        vk::UniqueCommandBuffer cmd_builder = std::move(
+            device->allocateCommandBuffersUnique({ *cmdpool, vk::CommandBufferLevel::ePrimary, 1 })[0]);
+        debug_name(cmd_builder, "AS Build Command");
+        cmd_builder->begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        debug_mark_insert(cmd_builder, "Build BLAS");
         debug_mark_begin(cmd_builder, fmt::format("Build Mesh#{}", m.id));
         
-        vk::AccelerationStructureInfoNV info;
-        info.type = vk::AccelerationStructureTypeNV::eBottomLevel;
-        info.flags = vk::BuildAccelerationStructureFlagBitsNV::ePreferFastTrace;
-        info.geometryCount = 1;
-        info.pGeometries = &m.g;
-        cmd_builder->buildAccelerationStructureNV(
-            info, nullptr, 0, false, *m.blas, nullptr, *scratch_buffer, 0);
+        m.build_geo.scratchData = scratch_addr;
+        const vk::AccelerationStructureBuildOffsetInfoKHR* pBuildOffsetInfo = &m.build_offset;
+        cmd_builder->buildAccelerationStructureKHR(m.build_geo, pBuildOffsetInfo);
 
-        vk::MemoryBarrier barrier(vk::AccessFlagBits::eAccelerationStructureWriteNV,
-            vk::AccessFlagBits::eAccelerationStructureReadNV);
-        cmd_builder->pipelineBarrier(vk::PipelineStageFlagBits::eAccelerationStructureBuildNV,
-            vk::PipelineStageFlagBits::eAccelerationStructureBuildNV,
+        vk::MemoryBarrier barrier(vk::AccessFlagBits::eAccelerationStructureWriteKHR,
+            vk::AccessFlagBits::eAccelerationStructureReadKHR);
+        cmd_builder->pipelineBarrier(vk::PipelineStageFlagBits::eAccelerationStructureBuildKHR,
+            vk::PipelineStageFlagBits::eAccelerationStructureBuildKHR,
             vk::DependencyFlags(), { barrier }, {}, {});
         
         debug_mark_end(cmd_builder);
-    }
-    vk::AccelerationStructureInfoNV build_tlas_info;
-    build_tlas_info.type = vk::AccelerationStructureTypeNV::eBottomLevel;
-    build_tlas_info.flags = vk::BuildAccelerationStructureFlagBitsNV::ePreferFastTrace;
-    build_tlas_info.instanceCount = (uint32_t)rt_instances.size();
-    debug_mark_insert(cmd_builder, "Build TLAS");
-    cmd_builder->buildAccelerationStructureNV(
-        build_tlas_info, *instance_buffer, 0, false, *tlas, nullptr, *scratch_buffer, 0);
-    cmd_builder->end();
+        cmd_builder->end();
 
-    vk::SubmitInfo cmd_build_submit;
-    cmd_build_submit.commandBufferCount = 1;
-    cmd_build_submit.pCommandBuffers = &cmd_builder.get();
-    q.submit(cmd_build_submit, nullptr);
-    q.waitIdle();
+        vk::SubmitInfo cmd_build_submit;
+        cmd_build_submit.commandBufferCount = 1;
+        cmd_build_submit.pCommandBuffers = &cmd_builder.get();
+        q.submit(cmd_build_submit, nullptr);
+        q.waitIdle();
+    }
+
+    // Build TLAS
+    {
+        vk::UniqueCommandBuffer cmd_builder = std::move(
+            device->allocateCommandBuffersUnique({ *cmdpool, vk::CommandBufferLevel::ePrimary, 1 })[0]);
+        debug_name(cmd_builder, "AS Build Command");
+        cmd_builder->begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+
+        debug_mark_insert(cmd_builder, "Build TLAS");
+        const vk::AccelerationStructureBuildOffsetInfoKHR* pBuildOffsetInfo = &tlas_build_offset;
+        cmd_builder->buildAccelerationStructureKHR(tlas_build_geo, pBuildOffsetInfo);
+        
+        debug_mark_end(cmd_builder);
+        cmd_builder->end();
+
+        vk::SubmitInfo cmd_build_submit;
+        cmd_build_submit.commandBufferCount = 1;
+        cmd_build_submit.pCommandBuffers = &cmd_builder.get();
+        q.submit(cmd_build_submit, nullptr);
+        q.waitIdle();
+    }
 
     // RT Pipeline
 
     // DescriptorSet Layout
-    std::array<vk::DescriptorSetLayoutBinding, 3> rt_descrset_layout_bindings{
-        vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eAccelerationStructureNV, 1, vk::ShaderStageFlagBits::eRaygenNV),
-        vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eRaygenNV),
-        vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eRaygenNV),
+    std::array<vk::DescriptorSetLayoutBinding, 4> rt_descrset_layout_bindings{
+        vk::DescriptorSetLayoutBinding(0, vk::DescriptorType::eAccelerationStructureKHR, 1, vk::ShaderStageFlagBits::eRaygenKHR),
+        vk::DescriptorSetLayoutBinding(1, vk::DescriptorType::eStorageImage, 1, vk::ShaderStageFlagBits::eRaygenKHR),
+        vk::DescriptorSetLayoutBinding(2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eRaygenKHR),
+        vk::DescriptorSetLayoutBinding(3, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eRaygenKHR),
     };
     vk::DescriptorSetLayoutCreateInfo rt_descrset_layout_info;
     rt_descrset_layout_info.bindingCount = (uint32_t)rt_descrset_layout_bindings.size();
@@ -660,16 +748,6 @@ int main_run()
     vk::UniqueDeviceMemory uniform_rt_mem = device->allocateMemoryUnique({ uniform_rt_mem_req.size, uniform_rt_mem_idx });
     debug_name(uniform_rt_mem, "RT Uniform Buffer Memory");
     device->bindBufferMemory(*uniform_rt_buffer, *uniform_rt_mem, 0);
-    if (auto ptr = reinterpret_cast<uniform_rt_buffers_t*>(device->mapMemory(*uniform_rt_mem, 0, VK_WHOLE_SIZE)))
-    {
-        float aspect = (float)surface_caps.currentExtent.width / (float)surface_caps.currentExtent.height;
-        glm::mat4 proj = glm::perspective(glm::radians(85.f), aspect, .1f, 100.f);
-        glm::mat4 view = glm::identity<glm::mat4>();
-        ptr->proj_inverse = glm::inverse(proj);
-        ptr->view_inverse = glm::inverse(view);
-        ptr->color = glm::vec4(0, 0, 0, 1);
-        device->unmapMemory(*uniform_rt_mem);
-    }
 
     // Create Output Image
     auto [rt_output, rt_output_mem, rt_output_view] =
@@ -678,15 +756,17 @@ int main_run()
 
     // Update DescriptorSets
     vk::DescriptorImageInfo rt_descr_set_image(nullptr, *rt_output_view, vk::ImageLayout::eGeneral);
-    vk::DescriptorBufferInfo rt_descr_set_ubo(*uniform_rt_buffer, 0, uniform_rt_buffers_t::mvp_size);
+    vk::DescriptorBufferInfo rt_descr_set_ubo_rgen(*uniform_rt_buffer, 0, uniform_rt_buffers_t::rgen_size);
+    vk::DescriptorBufferInfo rt_descr_set_ubo_rhit(*uniform_rt_buffer, uniform_rt_buffers_t::rhit_offset, uniform_rt_buffers_t::rhit_size);
     vk::StructureChain rt_descr_set_tlas_chain(
-        vk::WriteDescriptorSet(*rt_descr_sets, 0, 0, 1, vk::DescriptorType::eAccelerationStructureNV),
-        vk::WriteDescriptorSetAccelerationStructureNV(1, &tlas.get())
+        vk::WriteDescriptorSet(*rt_descr_sets, 0, 0, 1, vk::DescriptorType::eAccelerationStructureKHR),
+        vk::WriteDescriptorSetAccelerationStructureKHR(1, &tlas.get())
     );
-    std::array<vk::WriteDescriptorSet, 3> rt_descr_set_write{
+    std::array<vk::WriteDescriptorSet, 4> rt_descr_set_write{
         rt_descr_set_tlas_chain.get<vk::WriteDescriptorSet>(),
         vk::WriteDescriptorSet(*rt_descr_sets, 1, 0, 1, vk::DescriptorType::eStorageImage, &rt_descr_set_image),
-        vk::WriteDescriptorSet(*rt_descr_sets, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &rt_descr_set_ubo),
+        vk::WriteDescriptorSet(*rt_descr_sets, 2, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &rt_descr_set_ubo_rgen),
+        vk::WriteDescriptorSet(*rt_descr_sets, 3, 0, 1, vk::DescriptorType::eUniformBuffer, nullptr, &rt_descr_set_ubo_rhit),
     };
     device->updateDescriptorSets(rt_descr_set_write, nullptr);
 
@@ -705,30 +785,30 @@ int main_run()
     vk::UniqueShaderModule module_trace_rmiss = load_shader_module("shaders/trace.rmiss.spv");
     vk::UniqueShaderModule module_trace_rchit = load_shader_module("shaders/trace.rchit.spv");
     std::array<vk::PipelineShaderStageCreateInfo, 3> rt_pipeline_stages{
-        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eRaygenNV, *module_trace_rgen, "main"),
-        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eMissNV, *module_trace_rmiss, "main"),
-        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eClosestHitNV, *module_trace_rchit, "main"),
+        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eRaygenKHR, *module_trace_rgen, "main"),
+        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eMissKHR, *module_trace_rmiss, "main"),
+        vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eClosestHitKHR, *module_trace_rchit, "main"),
     };
 
     // Shader groups
-    std::array<vk::RayTracingShaderGroupCreateInfoNV, 3> rt_groups{
-        vk::RayTracingShaderGroupCreateInfoNV(vk::RayTracingShaderGroupTypeNV::eGeneral,
-            0, VK_SHADER_UNUSED_NV, VK_SHADER_UNUSED_NV, VK_SHADER_UNUSED_NV),
-        vk::RayTracingShaderGroupCreateInfoNV(vk::RayTracingShaderGroupTypeNV::eGeneral,
-            1, VK_SHADER_UNUSED_NV, VK_SHADER_UNUSED_NV, VK_SHADER_UNUSED_NV),
-        vk::RayTracingShaderGroupCreateInfoNV(vk::RayTracingShaderGroupTypeNV::eTrianglesHitGroup,
-            VK_SHADER_UNUSED_NV, 2, VK_SHADER_UNUSED_NV, VK_SHADER_UNUSED_NV),
+    std::array<vk::RayTracingShaderGroupCreateInfoKHR, 3> rt_groups{
+        vk::RayTracingShaderGroupCreateInfoKHR(vk::RayTracingShaderGroupTypeKHR::eGeneral,
+            0, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR),
+        vk::RayTracingShaderGroupCreateInfoKHR(vk::RayTracingShaderGroupTypeKHR::eGeneral,
+            1, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR),
+        vk::RayTracingShaderGroupCreateInfoKHR(vk::RayTracingShaderGroupTypeKHR::eTrianglesHitGroup,
+            VK_SHADER_UNUSED_KHR, 2, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR),
     };
 
     // Ray-tracing Pipeline
-    vk::RayTracingPipelineCreateInfoNV rt_pipeline_info;
+    vk::RayTracingPipelineCreateInfoKHR rt_pipeline_info;
     rt_pipeline_info.stageCount = (uint32_t)rt_pipeline_stages.size();
     rt_pipeline_info.pStages = rt_pipeline_stages.data();
     rt_pipeline_info.groupCount = (uint32_t)rt_groups.size();
     rt_pipeline_info.pGroups = rt_groups.data();
     rt_pipeline_info.maxRecursionDepth = 1;
     rt_pipeline_info.layout = *rt_pipeline_layout;
-    vk::UniquePipeline rt_pipeline = device->createRayTracingPipelineNVUnique(nullptr, rt_pipeline_info);
+    vk::UniquePipeline rt_pipeline = device->createRayTracingPipelineKHRUnique(nullptr, rt_pipeline_info).value;
     debug_name(rt_pipeline, "RT Pipeline");
 
     // Shaders Binding Table
@@ -736,7 +816,7 @@ int main_run()
     // Create Buffer
     vk::BufferCreateInfo sbt_buffer_info;
     sbt_buffer_info.size = rt_props.shaderGroupHandleSize * rt_pipeline_stages.size();
-    sbt_buffer_info.usage = vk::BufferUsageFlagBits::eRayTracingNV;
+    sbt_buffer_info.usage = vk::BufferUsageFlagBits::eRayTracingKHR;
     vk::UniqueBuffer sbt_buffer = device->createBufferUnique(sbt_buffer_info);
     debug_name(sbt_buffer, "SBT Buffer");
     vk::MemoryRequirements sbt_buffer_mem_req = device->getBufferMemoryRequirements(*sbt_buffer);
@@ -747,7 +827,7 @@ int main_run()
     device->bindBufferMemory(*sbt_buffer, *sbt_buffer_mem, 0);
     if (auto ptr = reinterpret_cast<uint8_t*>(device->mapMemory(*sbt_buffer_mem, 0, VK_WHOLE_SIZE)))
     {
-        device->getRayTracingShaderGroupHandlesNV<uint8_t>(*rt_pipeline, 0, (uint32_t)rt_pipeline_stages.size(), { (uint32_t)sbt_buffer_info.size, ptr });
+        device->getRayTracingShaderGroupHandlesKHR<uint8_t>(*rt_pipeline, 0, (uint32_t)rt_pipeline_stages.size(), { (uint32_t)sbt_buffer_info.size, ptr });
         device->unmapMemory(*sbt_buffer_mem);
     }
 
@@ -755,15 +835,34 @@ int main_run()
         device->allocateCommandBuffersUnique({ *cmdpool, vk::CommandBufferLevel::ePrimary, 1 })[0]);
     debug_name(cmd_trace, "cmd_trace");
     cmd_trace->begin({ { vk::CommandBufferUsageFlags() } });
-    cmd_trace->bindPipeline(vk::PipelineBindPoint::eRayTracingNV, *rt_pipeline);
-    cmd_trace->bindDescriptorSets(vk::PipelineBindPoint::eRayTracingNV, 
+    cmd_trace->bindPipeline(vk::PipelineBindPoint::eRayTracingKHR, *rt_pipeline);
+    cmd_trace->bindDescriptorSets(vk::PipelineBindPoint::eRayTracingKHR, 
         *rt_pipeline_layout, 0, *rt_descr_sets, nullptr);
+    
+    vk::ImageMemoryBarrier barrier;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+
+    barrier.image = *rt_output;
+    barrier.srcAccessMask = {};
+    barrier.dstAccessMask = vk::AccessFlagBits::eShaderWrite;
+    barrier.oldLayout = vk::ImageLayout::eUndefined;
+    barrier.newLayout = vk::ImageLayout::eGeneral;
+    cmd_trace->pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics, vk::PipelineStageFlagBits::eRayTracingShaderKHR,
+        vk::DependencyFlagBits::eByRegion, nullptr, nullptr, barrier);
+    
     debug_mark_insert(cmd_trace, "Trace Rays");
-    cmd_trace->traceRaysNV(
-        *sbt_buffer, rt_props.shaderGroupHandleSize * 0,
-        *sbt_buffer, rt_props.shaderGroupHandleSize * 1, rt_props.shaderGroupHandleSize,
-        *sbt_buffer, rt_props.shaderGroupHandleSize * 2, rt_props.shaderGroupHandleSize,
-        nullptr, 0, 0,
+    vk::DeviceSize sbt_size = rt_props.shaderGroupHandleSize * 3;
+    cmd_trace->traceRaysKHR(
+        { *sbt_buffer, rt_props.shaderGroupHandleSize * 0, rt_props.shaderGroupHandleSize, sbt_size },
+        { *sbt_buffer, rt_props.shaderGroupHandleSize * 1, rt_props.shaderGroupHandleSize, sbt_size },
+        { *sbt_buffer, rt_props.shaderGroupHandleSize * 2, rt_props.shaderGroupHandleSize, sbt_size },
+        { },
         surface_caps.currentExtent.width, surface_caps.currentExtent.height, 1);
     cmd_trace->end();
 
@@ -1204,7 +1303,6 @@ int main_run()
         cmd_draw[i]->begin({ vk::CommandBufferUsageFlags() });
         {
             vk::ImageMemoryBarrier barrier;
-            barrier.image = swapchain_images[i];
             barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
@@ -1213,11 +1311,20 @@ int main_run()
             barrier.subresourceRange.baseArrayLayer = 0;
             barrier.subresourceRange.layerCount = 1;
 
+            barrier.image = swapchain_images[i];
             barrier.srcAccessMask = {};
             barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
             barrier.oldLayout = vk::ImageLayout::eUndefined;
             barrier.newLayout = vk::ImageLayout::eTransferDstOptimal;
             cmd_draw[i]->pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics, vk::PipelineStageFlagBits::eTransfer,
+                vk::DependencyFlagBits::eByRegion, nullptr, nullptr, barrier);
+
+            barrier.image = *rt_output;
+            barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+            barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+            barrier.oldLayout = vk::ImageLayout::eGeneral;
+            barrier.newLayout = vk::ImageLayout::eTransferSrcOptimal;
+            cmd_draw[i]->pipelineBarrier(vk::PipelineStageFlagBits::eRayTracingShaderKHR, vk::PipelineStageFlagBits::eTransfer,
                 vk::DependencyFlagBits::eByRegion, nullptr, nullptr, barrier);
 
             vk::ImageBlit blit_region;
@@ -1227,13 +1334,22 @@ int main_run()
             blit_region.dstSubresource = vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1);
             blit_region.dstOffsets[0] = vk::Offset3D(0, 0, 0);
             blit_region.dstOffsets[1] = vk::Offset3D(surface_caps.currentExtent.width, surface_caps.currentExtent.height, 1);
-            cmd_draw[i]->blitImage(*rt_output, vk::ImageLayout::eGeneral,
+            cmd_draw[i]->blitImage(*rt_output, vk::ImageLayout::eTransferSrcOptimal,
                 swapchain_images[i], vk::ImageLayout::eTransferDstOptimal, blit_region, vk::Filter::eLinear);
 
+            barrier.image = *rt_output;
+            barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+            barrier.dstAccessMask = vk::AccessFlagBits::eShaderWrite;
+            barrier.oldLayout = vk::ImageLayout::eUndefined;
+            barrier.newLayout = vk::ImageLayout::eGeneral;
+            cmd_draw[i]->pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eRayTracingShaderKHR,
+                vk::DependencyFlagBits::eByRegion, nullptr, nullptr, barrier);
+
+            barrier.image = swapchain_images[i];
             barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
             barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
             barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-            barrier.newLayout = vk::ImageLayout::eColorAttachmentOptimal;
+            barrier.newLayout = vk::ImageLayout::ePresentSrcKHR;
             cmd_draw[i]->pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eColorAttachmentOutput,
                 vk::DependencyFlagBits::eByRegion, nullptr, nullptr, barrier);
 
@@ -1357,6 +1473,7 @@ int main_run()
                 ptr->proj_inverse = glm::inverse(glm::perspective(glm::radians(85.f), aspect, .1f, 100.f));
                 ptr->view_inverse = glm::inverse(glm::lookAt(cam_pos, glm::vec3(0, 0, 0), glm::vec3(0, -1, 0)));
                 ptr->color = glm::vec4(glm::sin(angle * 5.f), 0, 0, 1);
+                ptr->light_pos = glm::vec4(light_pos, 1.f);
                 device->unmapMemory(*uniform_rt_mem);
             }
 
@@ -1389,7 +1506,7 @@ int main_run()
         }
     }
 
-    //debug_messenger.reset();
+    debug_messenger.reset();
     exit(EXIT_SUCCESS);
 }
 

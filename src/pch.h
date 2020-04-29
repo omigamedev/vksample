@@ -5,6 +5,7 @@
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
 #define VK_USE_PLATFORM_WIN32_KHR
 #define VK_ENABLE_BETA_EXTENSIONS
+//#include <vulkan/vulkan.hpp>
 #include "vulkan.hpp"
 
 #include <windows.h>

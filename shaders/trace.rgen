@@ -1,30 +1,30 @@
 #version 460
-#extension GL_NV_ray_tracing : require
+#extension GL_EXT_ray_tracing : require
 #extension GL_GOOGLE_include_directive : enable
 
-layout (binding = 0, set = 0) uniform accelerationStructureNV tlas;
+layout (binding = 0, set = 0) uniform accelerationStructureEXT tlas;
 layout (binding = 1, set = 0, rgba32f) uniform image2D image;
 layout (binding = 2, set = 0) uniform ubo_t { 
     mat4 view_inverse;
     mat4 proj_inverse;
     vec4 color; 
 } ubo;
-layout (location = 0) rayPayloadNV vec3 hitValue;
+layout (location = 0) rayPayloadEXT vec3 hitValue;
 
 void main()
 {
-    const vec2 pixelCenter = vec2(gl_LaunchIDNV.xy) + vec2(0.5);
-    const vec2 inUV = pixelCenter / vec2(gl_LaunchSizeNV.xy);
+    const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    const vec2 inUV = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
     vec2 d = inUV * 2.0 - 1.0;
 
     vec4 origin    = ubo.view_inverse * vec4(0, 0, 0, 1);
     vec4 target    = ubo.proj_inverse * vec4(d.x, d.y, 1, 1);
     vec4 direction = ubo.view_inverse * vec4(normalize(target.xyz), 0);
 
-    uint  rayFlags = gl_RayFlagsOpaqueNV;
+    uint  rayFlags = gl_RayFlagsOpaqueEXT;
     float tMin     = 0.001;
     float tMax     = 10000.0;
-    traceNV(tlas,           // acceleration structure
+    traceRayEXT(tlas,           // acceleration structure
             rayFlags,       // rayFlags
             0xFF,           // cullMask
             0,              // sbtRecordOffset
@@ -37,5 +37,5 @@ void main()
             0               // payload (location = 0)
     );
 
-    imageStore(image, ivec2(gl_LaunchIDNV.xy), vec4(hitValue, 1.0));
+    imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(hitValue, 1.0));
 }
