@@ -422,7 +422,7 @@ int main_run()
     }
     importer.FreeScene();
 
-    // vertex buffer
+    // Create merged vertex buffers for all scene
     vk::BufferCreateInfo triangle_buffer_info;
     triangle_buffer_info.size = mesh_data_vert.size() * sizeof(vertex_t);
     triangle_buffer_info.usage = vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
@@ -430,6 +430,7 @@ int main_run()
     vk::MemoryRequirements triangle_buffer_mem_req = device->getBufferMemoryRequirements(*triangle_buffer);
     uint32_t triangle_buffer_mem_idx = find_memory(triangle_buffer_mem_req,
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    // Use chained properties to request eDeviceAddress flags
     vk::StructureChain triangle_buffer_mem_info{
         vk::MemoryAllocateInfo(triangle_buffer_mem_req.size, triangle_buffer_mem_idx),
         vk::MemoryAllocateFlagsInfo(vk::MemoryAllocateFlagBits::eDeviceAddress) };
@@ -484,10 +485,13 @@ int main_run()
 
     // Create RT objects
 
+    // Raytracing properties from getProperties2 extension
     auto rt_props = physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceRayTracingPropertiesKHR>()
         .get<vk::PhysicalDeviceRayTracingPropertiesKHR>();
     
     // BLAS
+    // Build bottom level acceleration structure
+    // see: https://developer.nvidia.com/blog/vulkan-raytracing/
     vk::DeviceSize blas_mem_size = 0;
     vk::DeviceSize scratch_size = 0;
     vk::MemoryRequirements2 blas_mem_req;
@@ -673,8 +677,8 @@ int main_run()
         const vk::AccelerationStructureBuildOffsetInfoKHR* pBuildOffsetInfo = &m.build_offset;
         cmd_builder->buildAccelerationStructureKHR(m.build_geo, pBuildOffsetInfo);
 
-        vk::MemoryBarrier barrier(vk::AccessFlagBits::eAccelerationStructureWriteKHR,
-            vk::AccessFlagBits::eAccelerationStructureReadKHR);
+        vk::MemoryBarrier barrier(vk::AccessFlagBits::eAccelerationStructureWriteKHR | vk::AccessFlagBits::eAccelerationStructureReadKHR,
+            vk::AccessFlagBits::eAccelerationStructureReadKHR | vk::AccessFlagBits::eAccelerationStructureReadKHR);
         cmd_builder->pipelineBarrier(vk::PipelineStageFlagBits::eAccelerationStructureBuildKHR,
             vk::PipelineStageFlagBits::eAccelerationStructureBuildKHR,
             vk::DependencyFlags(), { barrier }, {}, {});
@@ -744,8 +748,10 @@ int main_run()
     device->bindBufferMemory(*uniform_rt_buffer, *uniform_rt_mem, 0);
 
     // Create Output Image
+    const super_sample = 1;
+    glm::ivec2 output_size = glm::ivec2(surface_caps.currentExtent.width, surface_caps.currentExtent.height) * super_sample;
     auto [rt_output, rt_output_mem, rt_output_view] =
-        create_gbuffer("GBufferPOS", surface_caps.currentExtent, vk::Format::eR8G8B8A8Unorm,
+        create_gbuffer("GBufferPOS", vk::Extent2D(output_size.x, output_size.y), vk::Format::eR8G8B8A8Unorm,
             vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eStorage);
 
     // Update DescriptorSets
@@ -858,7 +864,7 @@ int main_run()
         { *sbt_buffer, rt_props.shaderGroupHandleSize * 1, rt_props.shaderGroupHandleSize, sbt_size },
         { *sbt_buffer, rt_props.shaderGroupHandleSize * 2, rt_props.shaderGroupHandleSize, sbt_size },
         { },
-        surface_caps.currentExtent.width, surface_caps.currentExtent.height, 1);
+        output_size.x, output_size.y, 1);
     cmd_trace->end();
 
     // Create clear screen command
@@ -868,8 +874,6 @@ int main_run()
     cmd_clear_info.level = vk::CommandBufferLevel::ePrimary;
     cmd_clear_info.commandBufferCount = (uint32_t)swapchain_images.size();
     std::vector<vk::UniqueCommandBuffer> cmd_draw = device->allocateCommandBuffersUnique(cmd_clear_info);
-    std::vector<vk::UniqueFramebuffer> framebuffers(swapchain_images.size());
-    std::vector<vk::UniqueImageView> swapchain_views(swapchain_images.size());
     std::vector<vk::CommandBuffer> submit_commands(swapchain_images.size());
     for (int i = 0; i < swapchain_images.size(); i++)
     {
@@ -904,7 +908,7 @@ int main_run()
             vk::ImageBlit blit_region;
             blit_region.srcSubresource = vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1);
             blit_region.srcOffsets[0] = vk::Offset3D(0, 0, 0);
-            blit_region.srcOffsets[1] = vk::Offset3D(surface_caps.currentExtent.width, surface_caps.currentExtent.height, 1);
+            blit_region.srcOffsets[1] = vk::Offset3D(output_size.x, output_size.y, 1);
             blit_region.dstSubresource = vk::ImageSubresourceLayers(vk::ImageAspectFlagBits::eColor, 0, 0, 1);
             blit_region.dstOffsets[0] = vk::Offset3D(0, 0, 0);
             blit_region.dstOffsets[1] = vk::Offset3D(surface_caps.currentExtent.width, surface_caps.currentExtent.height, 1);
@@ -952,7 +956,7 @@ int main_run()
             angle += glm::radians(1.f);
             glm::vec3 cam_pos = glm::vec3(glm::cos(angle * 0.1f), 0.5f, glm::sin(angle * 0.1f)) * 3.f;
             glm::vec3 light_pos = glm::vec3(glm::cos(angle), 0.3f, glm::sin(angle)) * 5.f;
-            float aspect = (float)surface_caps.currentExtent.width / (float)surface_caps.currentExtent.height;
+            float aspect = (float)output_size.x / (float)output_size.y;
             if (auto ptr = reinterpret_cast<uniform_rt_buffers_t*>(device->mapMemory(*uniform_rt_mem, 0, VK_WHOLE_SIZE)))
             {
                 ptr->proj_inverse = glm::inverse(glm::perspective(glm::radians(85.f), aspect, .1f, 100.f));
