@@ -62,4 +62,27 @@
       <Filter>Libs</Filter>
     </CopyFileToFolders>
   </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="shaders\composite.frag">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
+    <CustomBuild Include="shaders\composite.vert">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
+    <CustomBuild Include="shaders\trace.rchit">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
+    <CustomBuild Include="shaders\trace.rgen">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
+    <CustomBuild Include="shaders\trace.rmiss">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
+    <CustomBuild Include="shaders\triangle.frag">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
+    <CustomBuild Include="shaders\triangle.vert">
+      <Filter>Shaders</Filter>
+    </CustomBuild>
+  </ItemGroup>
 </Project>

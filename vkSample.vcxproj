@@ -35,24 +35,67 @@
     <ClInclude Include="src\pch.h" />
   </ItemGroup>
   <ItemGroup>
-    <CustomBuild Include="shaders\*.frag;shaders\*.vert;shaders\*.rchit;shaders\*.rgen;shaders\*.rmiss">
-      <FileType>Document</FileType>
-      <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">glslc -O -o $(SolutionDir)%(Identity).spv $(SolutionDir)%(Identity)</Command>
-      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">glslc -O -o $(SolutionDir)%(Identity).spv $(SolutionDir)%(Identity)</Command>
-      <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(SolutionDir)%(Identity).spv</Outputs>
-      <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(SolutionDir)%(Identity).spv</Outputs>
-      <Message Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Compile SPIR-V Shader: $(SolutionDir)%(Identity).spv</Message>
-      <Message Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Compile SPIR-V Shader: $(SolutionDir)%(Identity).spv</Message>
-      <TreatOutputAsContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</TreatOutputAsContent>
-      <TreatOutputAsContent Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</TreatOutputAsContent>
-      <OutputItemType Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">CopyFileToFolders</OutputItemType>
-      <OutputItemType Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CopyFileToFolders</OutputItemType>
-    </CustomBuild>
-  </ItemGroup>
-  <ItemGroup>
     <CopyFileToFolders Include="libs\assimp\out\install\x64-Release\bin\assimp-vc142-mt.dll">
       <FileType>Document</FileType>
     </CopyFileToFolders>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="shaders\composite.frag">
+      <FileType>Document</FileType>
+      <Command>glslc -O -o $(SolutionDir)%(Identity).spv $(SolutionDir)%(Identity)</Command>
+      <Outputs>$(SolutionDir)%(Identity).spv</Outputs>
+      <Message>Compile SPIR-V Shader: $(SolutionDir)%(Identity).spv</Message>
+      <TreatOutputAsContent>true</TreatOutputAsContent>
+      <OutputItemType>CopyFileToFolders</OutputItemType>
+    </CustomBuild>
+    <CustomBuild Include="shaders\composite.vert">
+      <FileType>Document</FileType>
+      <Command>glslc -O -o $(SolutionDir)%(Identity).spv $(SolutionDir)%(Identity)</Command>
+      <Outputs>$(SolutionDir)%(Identity).spv</Outputs>
+      <Message>Compile SPIR-V Shader: $(SolutionDir)%(Identity).spv</Message>
+      <TreatOutputAsContent>true</TreatOutputAsContent>
+      <OutputItemType>CopyFileToFolders</OutputItemType>
+    </CustomBuild>
+    <CustomBuild Include="shaders\trace.rchit">
+      <FileType>Document</FileType>
+      <Command>glslc -O -o $(SolutionDir)%(Identity).spv $(SolutionDir)%(Identity)</Command>
+      <Outputs>$(SolutionDir)%(Identity).spv</Outputs>
+      <Message>Compile SPIR-V Shader: $(SolutionDir)%(Identity).spv</Message>
+      <TreatOutputAsContent>true</TreatOutputAsContent>
+      <OutputItemType>CopyFileToFolders</OutputItemType>
+    </CustomBuild>
+    <CustomBuild Include="shaders\trace.rgen">
+      <FileType>Document</FileType>
+      <Command>glslc -O -o $(SolutionDir)%(Identity).spv $(SolutionDir)%(Identity)</Command>
+      <Outputs>$(SolutionDir)%(Identity).spv</Outputs>
+      <Message>Compile SPIR-V Shader: $(SolutionDir)%(Identity).spv</Message>
+      <TreatOutputAsContent>true</TreatOutputAsContent>
+      <OutputItemType>CopyFileToFolders</OutputItemType>
+    </CustomBuild>
+    <CustomBuild Include="shaders\trace.rmiss">
+      <FileType>Document</FileType>
+      <Command>glslc -O -o $(SolutionDir)%(Identity).spv $(SolutionDir)%(Identity)</Command>
+      <Outputs>$(SolutionDir)%(Identity).spv</Outputs>
+      <Message>Compile SPIR-V Shader: $(SolutionDir)%(Identity).spv</Message>
+      <TreatOutputAsContent>true</TreatOutputAsContent>
+      <OutputItemType>CopyFileToFolders</OutputItemType>
+    </CustomBuild>
+    <CustomBuild Include="shaders\triangle.frag">
+      <FileType>Document</FileType>
+      <Command>glslc -O -o $(SolutionDir)%(Identity).spv $(SolutionDir)%(Identity)</Command>
+      <Outputs>$(SolutionDir)%(Identity).spv</Outputs>
+      <Message>Compile SPIR-V Shader: $(SolutionDir)%(Identity).spv</Message>
+      <TreatOutputAsContent>true</TreatOutputAsContent>
+      <OutputItemType>CopyFileToFolders</OutputItemType>
+    </CustomBuild>
+    <CustomBuild Include="shaders\triangle.vert">
+      <FileType>Document</FileType>
+      <Command>glslc -O -o $(SolutionDir)%(Identity).spv $(SolutionDir)%(Identity)</Command>
+      <Outputs>$(SolutionDir)%(Identity).spv</Outputs>
+      <Message>Compile SPIR-V Shader: $(SolutionDir)%(Identity).spv</Message>
+      <TreatOutputAsContent>true</TreatOutputAsContent>
+      <OutputItemType>CopyFileToFolders</OutputItemType>
+    </CustomBuild>
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>16.0</VCProjectVersion>
